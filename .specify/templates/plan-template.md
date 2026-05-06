@@ -31,7 +31,15 @@
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+- [ ] **I. Privacy-First**: Does this feature process or transmit any data off-device? If yes, STOP.
+- [ ] **II. Hardware-Adaptive**: Has this feature been validated within the Pi 5 2GB memory budget (≤1400MB systemd limit)?
+- [ ] **III. Accuracy**: Are morphological filters, PTS timestamps, and MOG2 warmup applied in detection paths?
+- [ ] **IV. Resilience**: Does every long-running operation have a checkpoint + resume path?
+- [ ] **V. PWA/No Framework**: Does the frontend use Vanilla JS only? Is `innerHTML` with API data absent?
+- [ ] **VI. Transparency**: Is all new state written to human-readable JSON or SQLite? Is it in the audit log?
+- [ ] **VII. Hybrid Workflow**: Was `superpowers:brainstorm` run before implementation? Are all ISSUES.md fixes embedded?
+
+*Complexity justification required for any Constitution Check violation (see Complexity Tracking table).*
 
 ## Project Structure
 

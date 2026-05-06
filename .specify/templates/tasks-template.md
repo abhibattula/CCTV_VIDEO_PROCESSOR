@@ -7,10 +7,15 @@ description: "Task list template for feature implementation"
 
 **Input**: Design documents from `/specs/[###-feature-name]/`
 **Prerequisites**: plan.md (required), spec.md (required for user stories), research.md, data-model.md, contracts/
+**Constitution**: `.specify/memory/constitution.md` v1.0.0 — all tasks must comply with Principles I–VII
+**Issues Register**: `ISSUES.md` — cross-reference applicable issues for each task
+**Workflow**: Superpowers + SpecKit hybrid — `superpowers:brainstorm` MUST run before implementation tasks begin;
+  `superpowers:code-reviewer` MUST run after each phase completes.
 
-**Tests**: The examples below include test tasks. Tests are OPTIONAL - only include them if explicitly requested in the feature specification.
+**Tests**: The examples below include test tasks. Tests are OPTIONAL - only include them if explicitly requested.
 
-**Organization**: Tasks are grouped by user story to enable independent implementation and testing of each story.
+**Organization**: Tasks are grouped by implementation phase (aligned with the 10-phase plan) to enable
+independent implementation and validation of each phase.
 
 ## Format: `[ID] [P?] [Story] Description`
 
