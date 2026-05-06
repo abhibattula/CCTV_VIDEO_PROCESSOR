@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  cctv-analyst:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+      - ./ssl:/app/ssl
+      - ./cctv_analyst.db:/app/cctv_analyst.db
+      - ./config.json:/app/config.json
+      - /media:/media:ro
+    restart: unless-stopped
+    mem_limit: 1400m
+    cpus: 3.6
+    environment:
+      - PYTHONUNBUFFERED=1

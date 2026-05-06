@@ -1,0 +1,9 @@
+fastapi==0.111.*
+uvicorn[standard]==0.29.*
+opencv-python-headless==4.9.*
+numpy==1.26.*
+psutil==5.9.*
+pandas==2.2.*
+reportlab==4.1.*
+aiofiles==23.*
+python-multipart==0.0.*

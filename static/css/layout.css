@@ -1,0 +1,96 @@
+/* ─── App Shell ─────────────────────────────────────────────────────────────── */
+.app-shell {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  min-height: 100vh;
+}
+
+/* ─── Sidebar ───────────────────────────────────────────────────────────────── */
+#sidebar {
+  background: var(--bg-sidebar);
+  color: #cbd5e1;
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  z-index: 100;
+}
+
+.sidebar-logo {
+  padding: var(--space-5) var(--space-4);
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #f1f5f9;
+  border-bottom: 1px solid rgba(255,255,255,.1);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sidebar-logo svg { flex-shrink: 0; }
+
+.sidebar-nav { flex: 1; padding: var(--space-3) 0; }
+
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  color: #94a3b8;
+  font-size: .875rem;
+  transition: background .15s, color .15s;
+  border-radius: 0;
+}
+
+.nav-link:hover, .nav-link.active {
+  background: rgba(255,255,255,.08);
+  color: #f1f5f9;
+  text-decoration: none;
+}
+.nav-link.active { color: #60a5fa; }
+
+/* ─── Main content ──────────────────────────────────────────────────────────── */
+#app {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+}
+
+.page {
+  padding: var(--space-8);
+  max-width: 1200px;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-6);
+}
+
+.page-title { font-size: 1.5rem; font-weight: 700; }
+
+/* ─── Disk warning banner ───────────────────────────────────────────────────── */
+.disk-warning-banner {
+  background: #fef3c7;
+  border-bottom: 2px solid var(--color-warning);
+  color: #92400e;
+  padding: var(--space-2) var(--space-4);
+  font-size: .875rem;
+  font-weight: 500;
+  text-align: center;
+}
+[data-theme="dark"] .disk-warning-banner {
+  background: #451a03;
+  color: #fbbf24;
+}
+
+/* ─── Mobile ────────────────────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  .app-shell { grid-template-columns: 64px 1fr; }
+  .nav-link span { display: none; }
+  .sidebar-logo span { display: none; }
+  .page { padding: var(--space-4); }
+}

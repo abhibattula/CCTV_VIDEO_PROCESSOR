@@ -1,9 +1,12 @@
 # Feature Specification: [FEATURE NAME]
 
-**Feature Branch**: `[###-feature-name]`  
-**Created**: [DATE]  
-**Status**: Draft  
+**Feature Branch**: `[###-feature-name]`
+**Created**: [DATE]
+**Status**: Draft
 **Input**: User description: "$ARGUMENTS"
+**Reference**: `AI research/CCTV_Extractor_Documentation.md` | `AI research/RasPi_CCTV_Backend_Spec.docx` | `AI research/RasPi_CCTV_Frontend_Spec.docx`
+**Issues Register**: `ISSUES.md` — review all applicable issues before writing requirements
+**Constitution**: `.specify/memory/constitution.md` v1.0.0 — all FRs must comply with Principles I–VII
 
 ## User Scenarios & Testing *(mandatory)*
 
