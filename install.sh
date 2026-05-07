@@ -91,7 +91,7 @@ After=network.target
 [Service]
 Type=simple
 User=$USER
-WorkingDirectory="${INSTALL_DIR}"
+WorkingDirectory=${INSTALL_DIR}
 Environment=PYTHONUNBUFFERED=1
 ExecStart="${INSTALL_DIR}/venv/bin/python" -m uvicorn app.main:app --host 0.0.0.0 --port 5000 --workers 1 --ssl-keyfile ssl/key.pem --ssl-certfile ssl/cert.pem
 MemoryMax=1400M
