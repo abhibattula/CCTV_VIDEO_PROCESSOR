@@ -180,11 +180,6 @@ def get_job(job_id: str):
     event_dicts = [Event.from_row(e).to_dict() for e in events]
     included = [e for e in event_dicts if e["included"]]
     total_activity_s = sum(
-        (dict(e)["end_s"] if "end_s" in e else 0) - (dict(e)["start_s"] if "start_s" in e else 0)
-        for e in events if e["included"]
-    )
-    # Re-calculate from raw rows
-    total_activity_s = sum(
         float(e["end_s"]) - float(e["start_s"]) for e in events if e["included"]
     )
     source_dur = float(row["duration_s"] or 1)

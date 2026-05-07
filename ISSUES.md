@@ -656,3 +656,124 @@ This cannot be fully solved without object detection (YOLOv8n — deferred to v1
 ---
 
 *Document generated: 2026-05-05. All issues resolved in implementation before first commit of application code.*
+
+---
+
+## Post-Deployment Bug Register (2026-05-07)
+
+Discovered during first real Pi deployment. All fixed in commit `fix: resolve post-deployment bugs`.
+
+---
+
+### BUG-01 — Systemd service fails on paths with spaces 🔴 Blocker
+
+**Symptom on Pi:**
+```
+Unable to locate executable '/home/abhi/Desktop/PI': No such file or directory
+```
+**Root cause:** `install.sh` writes the systemd unit file using an unquoted shell variable `${INSTALL_DIR}`. When the installation path contains spaces (e.g. `PI PROJECTS/Video Processor/...`), systemd splits the value at the first space and tries to execute the truncated path as a binary.
+
+**Exact broken lines in generated service file:**
+```ini
+WorkingDirectory=/home/abhi/Desktop/PI PROJECTS/...     ← truncated by systemd
+ExecStart=/home/abhi/Desktop/PI PROJECTS/.../python ...  ← tries to exec "/home/abhi/Desktop/PI"
+```
+
+**Fix applied — `install.sh`:** Quote `${INSTALL_DIR}` in the heredoc so double quotes are literal characters written into the service file. Also collapsed multi-line `ExecStart` continuation (backslash line-continuation is unreliable in systemd unit files). Added `PYTHONUNBUFFERED=1` for clean log output.
+```ini
+WorkingDirectory="${INSTALL_DIR}"
+ExecStart="${INSTALL_DIR}/venv/bin/python" -m uvicorn app.main:app --host 0.0.0.0 --port 5000 ...
+```
+
+**Fix applied — `cctv-analyst.service`:** Updated static template with quoted paths and single-line `ExecStart`.
+
+**Files:** `install.sh`, `cctv-analyst.service`
+
+---
+
+### BUG-02 — Settings endpoint crashes with Pydantic v2 🔴 Blocker
+
+**Symptom:** `PUT /api/settings` raises `AttributeError: 'SettingsModel' object has no attribute 'dict'` or `PydanticUserError` on startup due to deprecated `@validator` decorator.
+
+**Root cause:** FastAPI 0.111 ships with Pydantic v2. The settings model used Pydantic v1 patterns:
+- `@validator(field)` decorator → removed in v2, replaced by `@field_validator`
+- `body.dict()` method → removed in v2, replaced by `body.model_dump()`
+
+**Fix applied — `app/api/settings.py`:**
+- `from pydantic import BaseModel, validator` → `from pydantic import BaseModel, field_validator`
+- All `@validator("field")` → `@field_validator("field")` with added `@classmethod` decorator
+- `body.dict()` → `body.model_dump(exclude_none=True)`
+
+**Files:** `app/api/settings.py`
+
+---
+
+### BUG-03 — FFmpeg exit code 1 accepted as success 🟠 High
+
+**Symptom:** Export produces empty or corrupt output with no error reported.
+
+**Root cause:** `_run_ffmpeg()` checked `if proc.returncode not in (0, 1)` — treating exit code 1 as success. FFmpeg only returns 0 on success; any non-zero code is a failure.
+
+**Fix applied — `app/core/export_engine.py`:**
+```diff
+- if proc.returncode not in (0, 1):
++ if proc.returncode != 0:
+```
+
+**Files:** `app/core/export_engine.py`
+
+---
+
+### BUG-04 — Path traversal vulnerability in upload finalize 🟠 Security
+
+**Symptom:** A malicious `filename` like `../../etc/passwd` in the upload init request could cause the assembled file to be written outside `UPLOAD_DIR`.
+
+**Root cause:** `final_path = UPLOAD_DIR / upload_id / filename` — `filename` was used verbatim without sanitisation.
+
+**Fix applied — `app/api/upload.py`:**
+```diff
+- final_path = UPLOAD_DIR / upload_id / filename
++ safe_name = Path(filename).name   # strips any directory components
++ final_path = UPLOAD_DIR / upload_id / safe_name
+```
+
+**Files:** `app/api/upload.py`
+
+---
+
+### BUG-05 — Upload endpoints crash on malformed chunk filenames 🟠 High
+
+**Symptom:** `upload_finalize` or `GET /upload/status/{id}` raises `ValueError: invalid literal for int()` if any file in the upload directory has a non-numeric chunk suffix.
+
+**Root cause:** `int(x.stem.split("_")[1])` called without exception handling. Any unexpected file in the directory (e.g., `meta.json` or OS temp files) causes a crash.
+
+**Fix applied — `app/api/upload.py`:** Added `_safe_chunk_index()` helper that catches `ValueError`/`IndexError` and returns `None`. All chunk collection loops now use this helper and skip unparseable entries.
+
+**Files:** `app/api/upload.py`
+
+---
+
+### BUG-06 — Dead code double-calculates total_activity_s 🟡 Minor
+
+**Symptom:** Wasted CPU on every `GET /api/jobs/{id}` call; confusing duplicate logic.
+
+**Root cause:** `total_activity_s` was calculated twice — first with a broken dict-access pattern (lines 182–185), then immediately overridden by the correct calculation (lines 187–189). The first block was unreachable dead code.
+
+**Fix applied — `app/api/jobs.py`:** Removed the first (incorrect) calculation block. Kept only the correct version.
+
+**Files:** `app/api/jobs.py`
+
+---
+
+### Post-Deployment Bug Summary
+
+| Bug | Severity | File(s) | Status |
+|---|---|---|---|
+| BUG-01: systemd spaces in path | 🔴 Blocker | `install.sh`, `cctv-analyst.service` | ✅ Fixed |
+| BUG-02: Pydantic v2 incompatibility | 🔴 Blocker | `app/api/settings.py` | ✅ Fixed |
+| BUG-03: FFmpeg exit code wrong | 🟠 High | `app/core/export_engine.py` | ✅ Fixed |
+| BUG-04: Upload path traversal | 🟠 Security | `app/api/upload.py` | ✅ Fixed |
+| BUG-05: Upload crash on bad chunk name | 🟠 High | `app/api/upload.py` | ✅ Fixed |
+| BUG-06: Dead code double calculation | 🟡 Minor | `app/api/jobs.py` | ✅ Fixed |
+
+*All 6 bugs fixed in commit on 2026-05-07.*

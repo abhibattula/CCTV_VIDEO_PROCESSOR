@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, field_validator
 
 from app.core.audit_logger import log as audit_log
 
@@ -43,19 +43,22 @@ class SettingsModel(BaseModel):
     mog2_history: Optional[int] = None
     allowed_browse_roots: Optional[list] = None
 
-    @validator("thermal_limit_c")
+    @field_validator("thermal_limit_c")
+    @classmethod
     def validate_thermal(cls, v):
         if v is not None and not (60 <= v <= 90):
             raise ValueError("thermal_limit_c must be between 60 and 90")
         return v
 
-    @validator("disk_warn_percent")
+    @field_validator("disk_warn_percent")
+    @classmethod
     def validate_disk_warn(cls, v):
         if v is not None and not (50 <= v <= 95):
             raise ValueError("disk_warn_percent must be between 50 and 95")
         return v
 
-    @validator("default_sensitivity")
+    @field_validator("default_sensitivity")
+    @classmethod
     def validate_sensitivity(cls, v):
         if v is not None and v not in ("low", "medium", "high"):
             raise ValueError("sensitivity must be low, medium, or high")
@@ -79,7 +82,7 @@ def get_settings():
 @router.put("/settings")
 def put_settings(body: SettingsModel):
     current = _read_config()
-    updates = {k: v for k, v in body.dict().items() if v is not None}
+    updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     current.update(updates)
     _CONFIG_PATH.write_text(json.dumps(current, indent=2))
     audit_log("SETTINGS_CHANGED", actor="user")

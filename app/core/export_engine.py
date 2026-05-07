@@ -23,7 +23,7 @@ def _run_ffmpeg(cmd: list, logger: Optional[Callable] = None) -> None:
             if line:
                 logger(f"[ffmpeg] {line}")
     proc.wait()
-    if proc.returncode not in (0, 1):  # ffmpeg uses 0 for success
+    if proc.returncode != 0:
         raise RuntimeError(f"FFmpeg exited with code {proc.returncode}")
 
 
