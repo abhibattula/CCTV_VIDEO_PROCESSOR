@@ -183,6 +183,7 @@ function _connectSse(jobId, logEl, summaryBar, jobData, cardsGrid, canvas) {
     },
     done: async (msg) => {
       _sse.disconnect();
+      document.getElementById('det-progress').style.display = 'none';
       try {
         const fresh = await api.jobs.get(jobId);
         _events = fresh.events;
@@ -190,7 +191,10 @@ function _connectSse(jobId, logEl, summaryBar, jobData, cardsGrid, canvas) {
         _renderCards(cardsGrid, _events, jobId, summaryBar, jobData);
         if (_events.length && _job.duration_s) timeline.updateEvents(_events);
 
-        // Show export result if completed
+        // Show detection result guidance card (FIX-C)
+        _showDetectionResult(fresh, jobId);
+
+        // Show export result if an export was already completed
         if (msg.status === 'completed' && fresh.job.output_name) {
           _showExportResult(fresh.job, jobId);
         }
@@ -244,6 +248,51 @@ function _renderCards(container, events, jobId, summaryBar, jobData) {
       timeline.updateEvents(events);
     });
     container.appendChild(card);
+  }
+}
+
+function _showDetectionResult(fresh, jobId) {
+  // FIX-C: Show clear post-detection guidance card so user knows what to do next
+  const existing = document.getElementById('detection-result-card');
+  if (existing) existing.remove();
+
+  const eventCount = fresh.event_count || 0;
+  const card = el('div', '', {
+    id: 'detection-result-card',
+    class: 'card',
+    style: `margin-bottom:16px;border-left:4px solid ${eventCount > 0 ? 'var(--color-success)' : 'var(--color-warning)'};`,
+  });
+
+  if (eventCount > 0) {
+    card.appendChild(el('h2', `Detection complete — ${eventCount} motion events found`, {
+      class: 'card-title',
+      style: 'color:var(--color-success);',
+    }));
+    const msg = el('p', '', { style: 'margin-bottom:12px;' });
+    msg.appendChild(el('span', 'Review the events on the timeline above. Exclude any false positives, then click '));
+    const highlight = el('strong', 'Export Selected Clips');
+    highlight.style.color = 'var(--color-primary)';
+    msg.appendChild(highlight);
+    msg.appendChild(el('span', ' to generate your highlight video.'));
+    card.appendChild(msg);
+  } else {
+    card.appendChild(el('h2', 'No motion detected', {
+      class: 'card-title',
+      style: 'color:var(--color-warning);',
+    }));
+    card.appendChild(el('p', 'The system processed the video but found no motion events.'));
+    const tips = el('ul', '', { style: 'margin:8px 0 0 16px;line-height:1.8;' });
+    tips.appendChild(el('li', 'Try resubmitting with High sensitivity'));
+    tips.appendChild(el('li', 'Confirm the video contains visible movement'));
+    tips.appendChild(el('li', 'Check the Live Log (expand below) for FFmpeg warnings'));
+    tips.appendChild(el('li', 'If the job shows Failed status, the error message explains why'));
+    card.appendChild(tips);
+  }
+
+  // Insert before the action buttons row
+  const actionRow = document.getElementById('export-btn')?.parentElement;
+  if (actionRow) {
+    actionRow.parentElement.insertBefore(card, actionRow);
   }
 }
 

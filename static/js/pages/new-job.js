@@ -101,8 +101,21 @@ export async function mount(container) {
   const warningsEl = el('div', '', { id: 'warnings', style: 'margin-bottom:16px;' });
   page.appendChild(warningsEl);
 
+  // FIX-D: Workflow info box — explains the 2-step process before the user submits
+  const flowInfo = el('div', '', {
+    style: 'background:var(--bg-input);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:.875rem;',
+  });
+  const flowTitle = el('strong', 'How it works:');
+  flowInfo.appendChild(flowTitle);
+  const steps = el('ol', '', { style: 'margin:6px 0 0 16px;line-height:1.9;' });
+  steps.appendChild(el('li', 'Detection runs automatically — the Pi analyses the video for motion (takes a few minutes)'));
+  steps.appendChild(el('li', 'Review events on the timeline — exclude false positives (shadows, wind, etc.)'));
+  steps.appendChild(el('li', 'Click Export Selected Clips — generates your highlight video'));
+  flowInfo.appendChild(steps);
+  page.appendChild(flowInfo);
+
   // Submit
-  const submitBtn = el('button', 'Start Analysis', { class: 'btn btn-primary btn-lg' });
+  const submitBtn = el('button', 'Start Analysis →', { class: 'btn btn-primary btn-lg' });
   submitBtn.addEventListener('click', async () => {
     const src = pathInput.value.trim() || _sourcePath;
     if (!src) { toast.error('Please specify a video source.'); return; }
