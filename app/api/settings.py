@@ -14,11 +14,11 @@ _CONFIG_PATH = Path(__file__).parent.parent.parent / "config.json"
 _DEFAULTS = {
     "default_output_dir": "~/cctv_output",
     "default_sensitivity": "medium",
-    "default_padding_s": 3,
-    "default_min_gap_s": 5,
-    "default_min_event_s": 3,
+    "default_padding_s": 2,
+    "default_min_gap_s": 2,
+    "default_min_event_s": 2,
     "default_output_quality": "original",
-    "default_frame_skip": 1,
+    "default_frame_skip": 0,   # process every frame (was 1 = every 2nd frame)
     "hw_decode": False,
     "thermal_limit_c": 80,
     "disk_warn_percent": 85,

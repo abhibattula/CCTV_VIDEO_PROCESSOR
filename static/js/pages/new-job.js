@@ -74,9 +74,9 @@ export async function mount(container) {
     g.appendChild(inp);
     return g;
   };
-  detCard.appendChild(makeNum('Padding (seconds)', 'padding', 3, 0, 30));
-  detCard.appendChild(makeNum('Min Gap (seconds)', 'mingap', 5, 1, 60));
-  detCard.appendChild(makeNum('Min Event (seconds)', 'minevent', 3, 1, 30));
+  detCard.appendChild(makeNum('Padding (seconds)', 'padding', 2, 0, 30));
+  detCard.appendChild(makeNum('Min Gap (seconds)', 'mingap', 2, 1, 60));
+  detCard.appendChild(makeNum('Min Event (seconds)', 'minevent', 2, 1, 30));
   page.appendChild(detCard);
 
   // Output settings
@@ -128,10 +128,11 @@ export async function mount(container) {
         source_path: src,
         settings: {
           sensitivity: selSens,
-          padding_s: parseInt(document.getElementById('padding').value) || 3,
-          min_gap_s: parseInt(document.getElementById('mingap').value) || 5,
-          min_event_s: parseInt(document.getElementById('minevent').value) || 3,
+          padding_s: parseInt(document.getElementById('padding').value) || 2,
+          min_gap_s: parseInt(document.getElementById('mingap').value) || 2,
+          min_event_s: parseInt(document.getElementById('minevent').value) || 2,
           output_quality: qualSel.value,
+          frame_skip: 0,
         },
       });
 

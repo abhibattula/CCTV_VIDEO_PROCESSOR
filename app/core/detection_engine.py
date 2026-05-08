@@ -31,9 +31,15 @@ from app.utils.time_utils import seconds_to_clock
 
 FRAME_SIZE = W * H * 3  # RGB24 bytes per frame
 
-SENSITIVITY_HISTORY = {"low": 700, "medium": 500, "high": 200}
-SENSITIVITY_THRESHOLD = {"low": 32, "medium": 16, "high": 8}
-MOTION_THRESHOLD = {"low": 0.02, "medium": 0.005, "high": 0.001}
+# MOG2 background model parameters
+SENSITIVITY_HISTORY   = {"low": 700, "medium": 500, "high": 200}
+SENSITIVITY_VAR_THR   = {"low": 32,  "medium": 16,  "high": 8}
+
+# Motion ratio thresholds (fraction of 320×240 pixels that must be foreground).
+# Lowered from original (0.02/0.005/0.001) — the 5×5 morphological OPEN was
+# shrinking legitimate motion regions, causing many real events to be missed.
+# At 320×240 a person 5m away is ~1200 px; 0.002 = 154 px minimum.
+MOTION_THRESHOLD      = {"low": 0.01, "medium": 0.002, "high": 0.0005}
 
 WARMUP_FRAMES = 500  # MOG2 warmup after crash resume (ISSUE-05)
 
@@ -201,7 +207,7 @@ def run(
 
     # --- MOG2 initialisation ---
     history = SENSITIVITY_HISTORY[sensitivity]
-    var_threshold = SENSITIVITY_THRESHOLD[sensitivity]
+    var_threshold = SENSITIVITY_VAR_THR[sensitivity]
     mog2 = cv2.createBackgroundSubtractorMOG2(
         history=history, varThreshold=var_threshold, detectShadows=True
     )
@@ -213,8 +219,11 @@ def run(
     # --- Zone mask ---
     zone_mask = _build_zone_mask(zones)
 
-    # --- Morphological kernel (ISSUE-07) ---
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # 3×3 kernel — less aggressive than the original 5×5.
+    # At 320×240 a 5×5 OPEN erodes 2px from every edge, which can completely
+    # erase small legitimate motion blobs (distant people, partial vehicles).
+    # 3×3 OPEN only erodes 1px, preserving small real motion regions.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     # Warmup pass after crash resume (ISSUE-05)
     if resume_pts is not None:
@@ -239,9 +248,9 @@ def run(
 
     conn = get_conn()
     frame_idx = 0
-    # FIX-B: PTS estimated from frame count — no showinfo race condition
     current_pts = resume_pts or 0.0
     first_frame_logged = False
+    batch_max_ratio = 0.0  # track highest motion ratio in current batch for diagnostics
 
     try:
         while True:
@@ -255,12 +264,17 @@ def run(
             # FIX-B: simple frame-count-based PTS (no showinfo, no race condition)
             current_pts = (resume_pts or 0.0) + frame_idx / target_fps
 
-            # Log first frame receipt so we know FFmpeg is producing output
-            if not first_frame_logged:
-                logger("[DETECTION] First frame received — FFmpeg pipeline is working")
-                first_frame_logged = True
-
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(H, W, 3)
+
+            # Log first frame diagnostics — mean brightness tells us if frames are black
+            if not first_frame_logged:
+                mean_brightness = int(np.mean(frame))
+                logger(
+                    f"[DETECTION] First frame received — FFmpeg pipeline is working. "
+                    f"Frame brightness: {mean_brightness}/255 "
+                    f"{'(WARNING: very dark frames — check video)' if mean_brightness < 5 else '(OK)'}"
+                )
+                first_frame_logged = True
 
             # Step 3: Preprocess
             gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
@@ -282,6 +296,8 @@ def run(
             # Step 7: Score
             motion_ratio = cv2.countNonZero(fg_mask) / (W * H)
             is_motion = motion_ratio >= motion_ratio_threshold
+            if motion_ratio > batch_max_ratio:
+                batch_max_ratio = motion_ratio
 
             # Step 8: Segment state machine
             if not in_event and is_motion:
@@ -346,11 +362,14 @@ def run(
                 total_events_so_far = conn.execute(
                     "SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)
                 ).fetchone()[0]
+                # Log max motion ratio so we can diagnose threshold issues
                 logger(
                     f"[{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}] "
                     f"Frame {frames_done}/{total_frames_est} — "
+                    f"max_motion={batch_max_ratio:.4f} (threshold={motion_ratio_threshold:.4f}) — "
                     f"{total_events_so_far} events so far"
                 )
+                batch_max_ratio = 0.0  # reset for next batch
 
                 ram_check(job_id, logger)
 
