@@ -50,11 +50,24 @@ def _build_ffmpeg_cmd(
     ss: Optional[float] = None,
     hw_decode: bool = False,
 ) -> list:
-    """Build FFmpeg pipe command. Frame skip via fps filter (ISSUE-06).
-    FIX-A: loglevel=warning so codec/format errors reach stderr for diagnostics.
-    FIX-B: showinfo removed — PTS estimated from frame count instead.
+    """Build FFmpeg pipe command for detection.
+
+    Key flags:
+    -ignore_editlist 1  Phone (Android/iPhone) videos embed an MP4 edit list
+                        specifying a tiny encoder-delay offset. When FFmpeg cannot
+                        find the keyframe at that offset it stops outputting frames
+                        after only a handful (< 10), long before any actual motion
+                        in the video. Ignoring the edit list decodes the full stream
+                        from frame 0.
+    -fflags +igndts     Ignore Decode TimeStamps — forces FFmpeg to trust
+                        Presentation TimeStamps instead. Fixes DTS discontinuities
+                        caused by edit lists and NVR recordings.
+    -loglevel warning   Surface codec/format warnings to stderr so they appear in
+                        the job log panel.
     """
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+           "-ignore_editlist", "1",       # phone-video edit list fix
+           "-fflags", "+igndts"]           # DTS discontinuity fix
     if hw_decode:
         cmd += ["-hwaccel", "auto"]
     if ss is not None:
@@ -175,12 +188,14 @@ def run(
         logger(f"[START] Detection started — source: {job['source_name']}")
 
     logger(
-        f"[DETECTION] FFmpeg starting — {target_fps:.1f} fps, {W}×{H} px, "
-        f"sensitivity={sensitivity}, source_fps={source_fps:.1f}"
+        f"[DETECTION] FFmpeg starting — target={target_fps:.1f}fps, "
+        f"source={source_fps:.1f}fps, frame_skip={frame_skip}, "
+        f"output={W}×{H}px, sensitivity={sensitivity}"
     )
 
     # --- Step 1: Start FFmpeg pipe ---
     cmd = _build_ffmpeg_cmd(source_path, target_fps, ss=resume_pts, hw_decode=hw_decode)
+    logger(f"[DETECTION] cmd: {' '.join(cmd[:8])}…")
 
     # FIX-B: stderr collected in a list so we can log it to the job on failure
     stderr_lines: list = []
