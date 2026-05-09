@@ -123,7 +123,32 @@ export async function mount(container, params) {
 
     try {
       await api.jobs.export(jobId);
-      toast.success('Export started. Watch the log panel for progress.');
+
+      // Reconnect SSE so export log lines appear in real time.
+      // The SSE was disconnected when detection completed; without this
+      // reconnect the log panel stays blank and export looks "frozen".
+      if (_sse) { _sse.disconnect(); _sse = null; }
+      _connectSse(jobId, logEl, summaryBar, jobData, cardsGrid, canvas);
+
+      // Fallback: poll every 4 s in case SSE doesn't reconnect (e.g. proxy strips
+      // keep-alive). When status returns to 'completed' we show the result card.
+      const pollInterval = setInterval(async () => {
+        try {
+          const fresh = await api.jobs.get(jobId);
+          if (fresh.job.status === 'completed' && fresh.job.output_name) {
+            clearInterval(pollInterval);
+            _showExportResult(fresh.job, jobId);
+            exportBtn.disabled = false;
+            exportBtn.textContent = 'Re-export';
+          } else if (fresh.job.status === 'failed') {
+            clearInterval(pollInterval);
+            toast.error('Export failed — check the log panel for details.');
+            exportBtn.disabled = false;
+            exportBtn.textContent = 'Export Selected Clips';
+          }
+        } catch { /* network blip — keep polling */ }
+      }, 4000);
+
     } catch (e) {
       toast.error(e.detail || e.message);
       exportBtn.disabled = false;
@@ -264,17 +289,27 @@ function _showDetectionResult(fresh, jobId) {
   });
 
   if (eventCount > 0) {
-    card.appendChild(el('h2', `Detection complete — ${eventCount} motion events found`, {
+    card.appendChild(el('h2', `Detection complete — ${eventCount} motion event${eventCount > 1 ? 's' : ''} found`, {
       class: 'card-title',
       style: 'color:var(--color-success);',
     }));
-    const msg = el('p', '', { style: 'margin-bottom:12px;' });
-    msg.appendChild(el('span', 'Review the events on the timeline above. Exclude any false positives, then click '));
+    const msg = el('p', '', { style: 'margin-bottom:8px;' });
+    msg.appendChild(el('span', 'Review the events on the timeline above. Exclude false positives, then click '));
     const highlight = el('strong', 'Export Selected Clips');
     highlight.style.color = 'var(--color-primary)';
     msg.appendChild(highlight);
     msg.appendChild(el('span', ' to generate your highlight video.'));
     card.appendChild(msg);
+
+    // Sensitivity calibration hint
+    const hint = el('p', '', { style: 'font-size:.85rem;color:var(--text-muted);margin-top:6px;' });
+    hint.appendChild(el('strong', 'Fewer events than expected? '));
+    hint.appendChild(el('span',
+      'High sensitivity (threshold=0.0005%) can merge separate events if background noise ' +
+      'keeps motion above the threshold during quiet periods. Try resubmitting with ' +
+      'Medium sensitivity to get better event separation.'
+    ));
+    card.appendChild(hint);
   } else {
     card.appendChild(el('h2', 'No motion detected', {
       class: 'card-title',
@@ -282,9 +317,10 @@ function _showDetectionResult(fresh, jobId) {
     }));
     card.appendChild(el('p', 'The system processed the video but found no motion events.'));
     const tips = el('ul', '', { style: 'margin:8px 0 0 16px;line-height:1.8;' });
-    tips.appendChild(el('li', 'Try resubmitting with High sensitivity'));
-    tips.appendChild(el('li', 'Confirm the video contains visible movement'));
-    tips.appendChild(el('li', 'Check the Live Log (expand below) for FFmpeg warnings'));
+    tips.appendChild(el('li', 'Try resubmitting with Medium sensitivity first, then High if still 0 events'));
+    tips.appendChild(el('li', 'Confirm the video contains visible movement (play a section in VLC)'));
+    tips.appendChild(el('li', 'Check the Live Log (expand below) — look for [DIAG frame 10] line'));
+    tips.appendChild(el('li', 'If [DIAG frame 10] is missing, the video format has a timing issue — re-encode to H.264 MP4 with HandBrake'));
     tips.appendChild(el('li', 'If the job shows Failed status, the error message explains why'));
     card.appendChild(tips);
   }

@@ -168,7 +168,16 @@ def generate_preview(
     end_s: float,
     token: str,
 ) -> str:
-    """Extract a temp clip for in-browser preview. Returns absolute path to clip (ISSUE-04)."""
+    """Extract a temp clip for in-browser preview. Returns absolute path to clip.
+
+    Root-cause fix: phone videos (Android/iPhone) have an MP4 edit list that
+    offsets the first frame's PTS by ~0.195 s. Without -ignore_editlist and
+    +genpts the extracted clip inherits that offset. The browser's video element
+    reads the metadata duration correctly (timeline moves) but the decoder cannot
+    render frames because the PTS stream doesn't start at 0. Adding +genpts
+    regenerates timestamps from 0 so the clip plays correctly. -avoid_negative_ts
+    make_zero ensures no segment has negative PTS after the seek.
+    """
     PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
     out_path = PREVIEW_DIR / f"{token}.mp4"
     clip_start = max(0.0, start_s - 2)
@@ -176,11 +185,14 @@ def generate_preview(
 
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ignore_editlist", "1",          # phone video edit list fix
+        "-fflags", "+igndts+genpts",       # regenerate PTS from 0 (root cause of blank preview)
         "-ss", str(clip_start),
         "-i", source_path,
         "-t", str(clip_dur),
         "-c", "copy",
-        "-movflags", "faststart",
+        "-avoid_negative_ts", "make_zero", # clamp any negative PTS after seek
+        "-movflags", "faststart",          # MOOV atom first for instant browser playback
         "-y",
         str(out_path),
     ]
