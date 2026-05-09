@@ -135,10 +135,10 @@ def run(
     (job_dir / "thumbnails").mkdir(exist_ok=True)
 
     sensitivity = settings.get("sensitivity", "medium")
-    frame_skip = int(settings.get("frame_skip", 1))
-    padding_s = float(settings.get("padding_s", 3))
-    min_gap_s = float(settings.get("min_gap_s", 5))
-    min_event_s = float(settings.get("min_event_s", 3))
+    frame_skip = int(settings.get("frame_skip", 0))
+    padding_s = float(settings.get("padding_s", 2))
+    min_gap_s = float(settings.get("min_gap_s", 2))
+    min_event_s = float(settings.get("min_event_s", 2))
     zones = settings.get("zones", [])
     hw_decode = bool(settings.get("hw_decode", False))
     recording_start = job.get("recording_start")
@@ -208,8 +208,12 @@ def run(
     # --- MOG2 initialisation ---
     history = SENSITIVITY_HISTORY[sensitivity]
     var_threshold = SENSITIVITY_VAR_THR[sensitivity]
+    # detectShadows=False: shadow pixels are marked 127 not 255 when True,
+    # and our threshold(200) turns them to 0 — silently discarding all shadow-
+    # region motion even when real people/vehicles are present. False means
+    # every motion pixel is 255, nothing is silently discarded.
     mog2 = cv2.createBackgroundSubtractorMOG2(
-        history=history, varThreshold=var_threshold, detectShadows=True
+        history=history, varThreshold=var_threshold, detectShadows=False
     )
     motion_ratio_threshold = MOTION_THRESHOLD[sensitivity]
 
@@ -281,13 +285,25 @@ def run(
             if sensitivity == "high":
                 gray = clahe.apply(gray)
 
-            # Step 4: MOG2
+            # Step 4: MOG2 — output is 0 (background) or 255 (motion) only,
+            # since detectShadows=False. No threshold step needed.
             fg_mask = mog2.apply(gray)
-            _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+            raw_fg_count = cv2.countNonZero(fg_mask)  # save before morphology
 
-            # Step 5: Morphological filter (ISSUE-07)
+            # Step 5: Morphological filter — 3×3 OPEN removes isolated noise pixels,
+            # CLOSE fills small gaps inside real motion regions.
             fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
             fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+
+            # Diagnostic at frame 10: how many pixels survived each stage
+            if frame_idx == 9:
+                after_morph = cv2.countNonZero(fg_mask)
+                needed = int(motion_ratio_threshold * W * H)
+                logger(
+                    f"[DIAG frame 10] MOG2 raw={raw_fg_count}px "
+                    f"→ after_morph={after_morph}px "
+                    f"(need >={needed}px for a detection at {sensitivity} sensitivity)"
+                )
 
             # Step 6: Zone mask
             if zone_mask is not None:
