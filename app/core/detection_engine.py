@@ -47,34 +47,57 @@ WARMUP_FRAMES = 500  # MOG2 warmup after crash resume (ISSUE-05)
 def _build_ffmpeg_cmd(
     source_path: str,
     target_fps: float,
+    frame_skip: int = 0,
     ss: Optional[float] = None,
     hw_decode: bool = False,
 ) -> list:
     """Build FFmpeg pipe command for detection.
 
-    Key flags:
-    -ignore_editlist 1  Phone (Android/iPhone) videos embed an MP4 edit list
-                        specifying a tiny encoder-delay offset. When FFmpeg cannot
-                        find the keyframe at that offset it stops outputting frames
-                        after only a handful (< 10), long before any actual motion
-                        in the video. Ignoring the edit list decodes the full stream
-                        from frame 0.
-    -fflags +igndts     Ignore Decode TimeStamps — forces FFmpeg to trust
-                        Presentation TimeStamps instead. Fixes DTS discontinuities
-                        caused by edit lists and NVR recordings.
-    -loglevel warning   Surface codec/format warnings to stderr so they appear in
-                        the job log panel.
+    Flag rationale:
+    -ignore_editlist 1
+        Phone videos (Android/iPhone) embed an MP4 edit list with a tiny
+        encoder-delay offset (e.g. 11710/60000 = 0.195 s). FFmpeg honours
+        it by seeking to that offset, but when the index entry is missing it
+        exits after only a few frames — never reaching the part of the video
+        that has motion.
+
+    -fflags +igndts+genpts
+        +igndts  : ignore Decode TimeStamps, trust Presentation TimeStamps.
+        +genpts  : THE KEY FIX — regenerates PTS from scratch starting at 0.
+                   Without this, the fps filter sees source frames whose first
+                   PTS is 0.195 s (the edit list offset), while it expects
+                   frames starting at 0.000 s. The mismatch causes it to output
+                   1–9 frames then silently stop, which is why the [DIAG frame 10]
+                   line never appears and 0 events are found. With +genpts, every
+                   source frame gets a clean PTS starting at 0 → fps filter works
+                   for the full video.
+
+    fps filter — only when frame_skip > 0:
+        When frame_skip=0 every source frame must be processed; adding
+        fps=source_fps is a no-op that still applies the timestamp logic above
+        and risks the same stall. Skip the filter entirely — just scale and pipe.
+        When frame_skip>0, fps=target_fps correctly halves (or thirds, etc.)
+        the frame rate before Python sees any data.
     """
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-           "-ignore_editlist", "1",       # phone-video edit list fix
-           "-fflags", "+igndts"]           # DTS discontinuity fix
+           "-ignore_editlist", "1",
+           "-fflags", "+igndts+genpts"]
     if hw_decode:
         cmd += ["-hwaccel", "auto"]
     if ss is not None:
         cmd += ["-ss", str(ss)]
+
+    # Only use the fps filter when we actually need to drop frames.
+    # For frame_skip=0 (process every frame) the filter is a no-op that
+    # introduces the timestamp-alignment stall described above.
+    if frame_skip > 0:
+        vf = f"fps={target_fps:.6f},scale={W}:{H}"
+    else:
+        vf = f"scale={W}:{H}"
+
     cmd += [
         "-i", source_path,
-        "-vf", f"fps={target_fps:.6f},scale={W}:{H}",
+        "-vf", vf,
         "-pix_fmt", "rgb24",
         "-f", "rawvideo",
         "-",
@@ -194,8 +217,11 @@ def run(
     )
 
     # --- Step 1: Start FFmpeg pipe ---
-    cmd = _build_ffmpeg_cmd(source_path, target_fps, ss=resume_pts, hw_decode=hw_decode)
-    logger(f"[DETECTION] cmd: {' '.join(cmd[:8])}…")
+    cmd = _build_ffmpeg_cmd(
+        source_path, target_fps,
+        frame_skip=frame_skip, ss=resume_pts, hw_decode=hw_decode,
+    )
+    logger(f"[DETECTION] cmd: {' '.join(cmd[:10])}…")
 
     # FIX-B: stderr collected in a list so we can log it to the job on failure
     stderr_lines: list = []
