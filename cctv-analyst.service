@@ -1,13 +1,22 @@
+# cctv-analyst.service — TEMPLATE ONLY
+#
+# DO NOT USE THIS FILE DIRECTLY.
+# Run 'bash install.sh' — it generates a correct service file with your
+# actual username and installation path substituted in automatically.
+#
+# This template is kept in the repository for reference only.
+# The generated file will be written to /etc/systemd/system/cctv-analyst.service
+
 [Unit]
 Description=RasPi CCTV Analyst
 After=network.target
 
 [Service]
 Type=simple
-User=abhi
-WorkingDirectory=/home/abhi/Desktop/PI PROJECTS/Video Processor/CCTV_VIDEO_PROCESSOR
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/CCTV_VIDEO_PROCESSOR
 Environment=PYTHONUNBUFFERED=1
-ExecStart="/home/abhi/Desktop/PI PROJECTS/Video Processor/CCTV_VIDEO_PROCESSOR/venv/bin/python" -m uvicorn app.main:app --host 0.0.0.0 --port 5000 --workers 1 --ssl-keyfile ssl/key.pem --ssl-certfile ssl/cert.pem
+ExecStart="/path/to/CCTV_VIDEO_PROCESSOR/venv/bin/python" -m uvicorn app.main:app --host 0.0.0.0 --port 5000 --workers 1 --ssl-keyfile ssl/key.pem --ssl-certfile ssl/cert.pem
 MemoryMax=1400M
 CPUQuota=360%
 Restart=on-failure

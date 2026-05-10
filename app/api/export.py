@@ -30,11 +30,10 @@ def trigger_export(job_id: str):
     if row["status"] == JobStatus.EXPORTING:
         raise HTTPException(status_code=409, detail="Export already in progress.")
 
-    # Run export in background thread (non-blocking response)
+    # Run export in background thread (non-blocking response).
+    # run_export reads settings internally from DB — no need to pass them here.
     def _run():
         from app.core.job_queue import job_queue
-        import json
-        settings = json.loads(row["settings"]) if row["settings"] else {}
         job_queue.run_export(job_id)
 
     t = threading.Thread(target=_run, daemon=True)
