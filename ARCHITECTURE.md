@@ -394,6 +394,31 @@ Before a single line of application code was written, a brainstorming pass ident
 
 ---
 
+## Post-Deployment Bug Register
+
+These bugs were found during real Pi deployment and fixed in branches `001` and `002`.
+See `DETECTION_NOTES.md` for the full detection-specific register.
+
+| Bug | Severity | Root Cause | Fix |
+|---|---|---|---|
+| systemd path-with-spaces | Critical | `${INSTALL_DIR}` unquoted in generated unit file | Quoted `ExecStart` path in `install.sh` heredoc |
+| Pydantic v2 incompatibility | Critical | `@validator` / `.dict()` are Pydantic v1 APIs; FastAPI 0.111 ships v2 | `@field_validator` + `.model_dump()` |
+| `-ignore_editlist 1` in detection | Critical | Forces decoding of H.264 encoder pre-roll frames → decoder crash after 10–29 frames | Removed; `+genpts` alone is sufficient |
+| `frame_idx` UnboundLocalError | Critical | Warmup block referenced `frame_idx` 25 lines before its definition | Moved `frame_idx = 0` to before warmup block |
+| `frame_idx` reset after warmup | Critical | Second `frame_idx = 0` discarded warmup count → wrong PTS | Removed the stale reset |
+| `detectShadows=True` + threshold 200 | Critical | Shadow pixels (127) erased by `threshold(200)` → 0 foreground pixels | `detectShadows=False` |
+| FFmpeg fps filter stall | Critical | Edit list PTS offset (0.195s) misaligns fps filter expected timestamps | `-fflags +genpts` regenerates PTS from 0 |
+| Preview blank video | Major | `generate_preview` missing `+genpts` → clip PTS not from 0 → browser decoder fails | Added `+igndts+genpts`, `avoid_negative_ts` |
+| Export SSE disconnect | Major | SSE not reconnected after export starts → log panel blank | Reconnect SSE + 4s polling fallback |
+| `_restore_interrupted_jobs` re-detects | Major | Exported jobs reset to queued → re-ran 2h detection unnecessarily | Exporting → completed; Detecting → queued |
+| f-string JSON in upload_init | Major | Filenames with `"` produce malformed JSON → upload_finalize crashes | `json.dumps()` instead of f-string |
+| Zone frame in `/tmp` | Minor | Never cleaned up → fills disk on low-storage Pi | Moved to `JOBS_DIR/{job_id}/zone_frame.jpg` |
+| Export polling leak on unmount | Minor | `setInterval` not cleared on navigation → background network calls | Hoisted to module scope; `unmount()` clears it |
+| `asyncio.get_event_loop()` deprecated | Minor | Python 3.10+ deprecation warning in journal | Changed to `get_running_loop()` |
+| Dead `settings` variable in export | Cosmetic | JSON parsed but never used | Removed |
+
+---
+
 ## Running Tests
 
 There is no automated test suite in v1. Testing follows the manual acceptance criteria in `specs/001-raspi-cctv-v1-core/quickstart.md`.

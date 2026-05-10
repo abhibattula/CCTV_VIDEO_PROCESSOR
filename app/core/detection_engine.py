@@ -273,6 +273,12 @@ def run(
     # 3×3 OPEN only erodes 1px, preserving small real motion regions.
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
+    # frame_idx must be defined before the warmup block because the warmup
+    # increments it. It is intentionally NOT reset after warmup — the warmup
+    # count is kept so current_pts = frame_idx/target_fps reflects actual
+    # source position (CRIT-1 + CRIT-2 fix).
+    frame_idx = 0
+
     # Initial warmup — fresh detection only (not crash resume, which has its own warmup).
     # MOG2 initialises with high-variance Gaussians: during the first ~30 frames the
     # classifier is noisy, often producing 30–200 foreground pixels that exceed the
@@ -314,7 +320,10 @@ def run(
     event_index = last_confirmed_index + 1
 
     conn = get_conn()
-    frame_idx = 0
+    # frame_idx was initialised to 0 before the warmup block above and is now
+    # INITIAL_WARMUP (30 for fresh start, 0 for crash resume whose warmup doesn't
+    # increment it). Do NOT reset here — we keep the warmup count for correct PTS.
+
     current_pts = resume_pts or 0.0
     first_frame_logged = False
     batch_max_ratio = 0.0  # track highest motion ratio in current batch for diagnostics
@@ -328,7 +337,8 @@ def run(
             if cancel_event.is_set():
                 break
 
-            # FIX-B: simple frame-count-based PTS (no showinfo, no race condition)
+            # PTS = total frames read (including warmup) / target fps.
+            # For crash resume, resume_pts anchors the absolute time.
             current_pts = (resume_pts or 0.0) + frame_idx / target_fps
 
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(H, W, 3)
@@ -358,12 +368,14 @@ def run(
             fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
             fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
 
-            # Diagnostic at frame 10: how many pixels survived each stage
-            if frame_idx == 9:
+            # Diagnostic at first real detection frame + 9 (10th frame after warmup).
+            # INITIAL_WARMUP frames were skipped before the main loop, so we target
+            # INITIAL_WARMUP + 9 rather than the literal index 9.
+            if frame_idx == INITIAL_WARMUP + 9:
                 after_morph = cv2.countNonZero(fg_mask)
                 needed = int(motion_ratio_threshold * W * H)
                 logger(
-                    f"[DIAG frame 10] MOG2 raw={raw_fg_count}px "
+                    f"[DIAG frame {INITIAL_WARMUP + 10}] MOG2 raw={raw_fg_count}px "
                     f"→ after_morph={after_morph}px "
                     f"(need >={needed}px for a detection at {sensitivity} sensitivity)"
                 )

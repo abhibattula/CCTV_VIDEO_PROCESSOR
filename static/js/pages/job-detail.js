@@ -10,6 +10,7 @@ let _sse = null;
 let _events = [];
 let _job = null;
 let _logLines = [];
+let _pollInterval = null;  // IMP-8: module-scope so unmount() can clear it
 const MAX_LOG_DOM = 200;
 
 export async function mount(container, params) {
@@ -132,16 +133,19 @@ export async function mount(container, params) {
 
       // Fallback: poll every 4 s in case SSE doesn't reconnect (e.g. proxy strips
       // keep-alive). When status returns to 'completed' we show the result card.
-      const pollInterval = setInterval(async () => {
+      // IMP-8: use module-level _pollInterval so unmount() can clear it on navigation.
+      if (_pollInterval) clearInterval(_pollInterval);
+      _pollInterval = setInterval(async () => {
         try {
           const fresh = await api.jobs.get(jobId);
           if (fresh.job.status === 'completed' && fresh.job.output_name) {
-            clearInterval(pollInterval);
+            clearInterval(_pollInterval); _pollInterval = null;
+            _job = fresh.job;  // IMP-4: update module-level _job so status badge stays current
             _showExportResult(fresh.job, jobId);
             exportBtn.disabled = false;
             exportBtn.textContent = 'Re-export';
           } else if (fresh.job.status === 'failed') {
-            clearInterval(pollInterval);
+            clearInterval(_pollInterval); _pollInterval = null;
             toast.error('Export failed — check the log panel for details.');
             exportBtn.disabled = false;
             exportBtn.textContent = 'Export Selected Clips';
@@ -191,6 +195,7 @@ export function unmount() {
   _events = [];
   _job = null;
   _logLines = [];
+  if (_pollInterval) { clearInterval(_pollInterval); _pollInterval = null; }  // IMP-8
 }
 
 function _connectSse(jobId, logEl, summaryBar, jobData, cardsGrid, canvas) {

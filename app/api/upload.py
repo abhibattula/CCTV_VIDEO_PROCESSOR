@@ -29,9 +29,10 @@ async def upload_init(body: dict):
     upload_dir = UPLOAD_DIR / upload_id
     upload_dir.mkdir(parents=True, exist_ok=True)
 
+    import json as _json
     (upload_dir / "meta.json").write_text(
-        f'{{"filename":"{filename}","total_size":{total_size}}}'
-    )
+        _json.dumps({"filename": filename, "total_size": total_size})
+    )  # IMP-7: use json.dumps, not f-string — filenames can contain quotes/backslashes
 
     return {"upload_id": upload_id, "chunk_size": CHUNK_SIZE}
 

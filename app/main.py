@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
     init_db()
 
     from app.core.log_buffer import log_buffer
-    log_buffer.set_loop(asyncio.get_event_loop())
+    log_buffer.set_loop(asyncio.get_running_loop())  # get_event_loop() deprecated in Python 3.10+
 
     from app.core.job_queue import job_queue
     job_queue.start()

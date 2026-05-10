@@ -2,18 +2,18 @@
 
 > Developer reference. Documents every detection bug found during deployment,
 > its root cause, the evidence chain, and the exact fix applied.
-> Branch: `002-detection-pts-fix`
+> Updated: 2026-05-10 | Branch: `002-detection-pts-fix`
 
 ---
 
 ## The Detection Pipeline (Brief)
 
 ```
-FFmpeg pipe → stdout (RGB24 frames) → MOG2 → morphological filter →
-motion ratio → segment state machine → events DB
+FFmpeg subprocess (stdout) → FRAME_SIZE bytes/frame → MOG2 → morphological filter
+→ motion_ratio → segment state machine → events DB → log_buffer → SSE → browser
 ```
 
-FFmpeg stderr → background thread → log_buffer → SSE → browser log panel
+FFmpeg subprocess stderr → background thread → filter lines → job log panel
 
 ---
 
@@ -21,148 +21,270 @@ FFmpeg stderr → background thread → log_buffer → SSE → browser log panel
 
 ---
 
-### BUG-DET-01 — FFmpeg produces 10–29 frames then exits (CRITICAL)
+### BUG-DET-01 — FFmpeg produces 10–29 frames then exits early
 
-**Symptom**: Log shows `[DIAG frame 10]` then immediately `[DONE] Detection complete — 1 motion events found`. No checkpoint lines. Preview clip shows static empty scene. Real motion events never processed.
+**Symptom**: `[DIAG frame N]` fires, then immediately `[DONE] 1 motion events found`.
+No checkpoint lines (checkpoints fire every 30 frames → fewer than 30 frames processed).
+Preview clip shows empty static scene. Real motion events never processed.
 
-**Evidence**:
-- Checkpoints fire every 30 frames. No checkpoint → `frame_idx < 30` at exit.
-- `[DIAG frame 10]` fires at `frame_idx == 9` → confirmed at least 10 frames.
-- Therefore: 10 ≤ frames_done ≤ 29. A 60+ second video should produce 3600+ frames.
-- The 1 "event" is a spurious end-of-video close: `in_event=True` from MOG2 init noise, `event_end = ~0.3 + 2 = 2.3s`, `duration = 2.3s ≥ min_event_s=2` → kept.
+**Evidence**: DIAG at `frame_idx == INITIAL_WARMUP + 9`. No checkpoint →
+`frame_idx < 30 + INITIAL_WARMUP` at exit. A 115-second 60fps video has 6864 frames.
 
-**Root Cause**: `-ignore_editlist 1` was in the FFmpeg command.
+**Root Cause 1 (original)**: `-ignore_editlist 1` forces FFmpeg to decode encoder
+pre-roll frames (0–0.195s before the edit list position). These frames have
+broken/absent reference frames — H.264 encoder warmup, not intended for display.
+FFmpeg produces 10–29 corrupt output frames then hits unrecoverable decoder state.
 
-Android/iPhone phone videos contain an MP4 edit list that says:
-> "Skip the first N frames. These are encoder pre-roll (warmup). The video starts at timestamp T."
+**Root Cause 2 (in `002` branch)**: `-ignore_editlist 1` was supposed to be
+removed, but a secondary effect was that `frame_idx` was being referenced before
+assignment (CRIT-1 below), crashing with `UnboundLocalError` on every fresh job.
 
-For the test video: edit list at timestamp `11710`, timescale `60000` → `11710/60000 = 0.195 seconds` of encoder warmup.
+**Correct fix**: DO NOT use `-ignore_editlist 1` in detection. Use `-fflags +igndts+genpts`:
+- FFmpeg honours the edit list (skips pre-roll)
+- `+genpts` regenerates PTS from 0 after the edit list skip
+- fps filter (when used for frame_skip>0) receives frames at PTS=0,1/fps,2/fps ✓
 
-When FFmpeg is told to **ignore** the edit list (`-ignore_editlist 1`), it starts decoding from absolute byte 0 — including those encoder warmup frames. These frames have **broken or absent reference frames**. They were produced before the H.264 encoder had enough data to create clean inter-prediction. They are not intended for display.
-
-FFmpeg attempts to decode them, produces 10–29 corrupt/partial output frames, then hits an unrecoverable decoder state and exits. The Python read loop gets EOF. Detection ends after 0.5 seconds of video content.
-
-**What was the intent?** `-ignore_editlist 1` was added to prevent an earlier bug where the `fps` filter stalled because the edit list made the first frame's PTS = 0.195s instead of 0.000s. The fix was `+genpts`. Both were added, but `-ignore_editlist 1` made things worse.
-
-**The correct relationship**:
-- `-fflags +genpts` regenerates PTS from 0 **after** the edit list skip → fps filter gets frames at PTS=0,1/fps,2/fps,... → works correctly ✓
-- `-ignore_editlist 1` forces decoding **before** the edit list skip → broken pre-roll frames → early exit ✗
-- These two flags conflict. `+genpts` alone is the correct fix. `-ignore_editlist` must be absent.
-
-**Fix**: Removed `-ignore_editlist 1` from `_build_ffmpeg_cmd()` in `detection_engine.py`. The flag remains in `generate_preview()` in `export_engine.py` where it is harmless (fast seek past pre-roll, not sequential decoding).
-
-**Commit**: `002-detection-pts-fix` branch
+**Commit**: `4812ee5`, `822f820`
 
 ---
 
-### BUG-DET-02 — Spurious event at T=0 from MOG2 initialisation
+### BUG-DET-02 — `UnboundLocalError: frame_idx referenced before assignment` (CRIT-1 + CRIT-2)
 
-**Symptom**: 1 event detected at the very beginning of the video (T=0 to ~2.5s), preview shows empty static scene.
+**Symptom**: Every fresh (non-resume) detection job immediately fails with
+`UnboundLocalError`. Resume jobs unaffected.
 
-**Root Cause**: MOG2 initialises with high-variance Gaussian distributions for all pixels. During the first 30 frames, the classifier has no background model and produces noisy foreground output. At `sensitivity=high`, the threshold is 0.0005 × 320 × 240 = 38 pixels. MOG2 init noise easily exceeds this, triggering `is_motion=True` from frame 0. If the video has little actual motion in the first 3 seconds (e.g., user placed camera and waited), the event stays open until the end-of-video close block:
+**Root Cause**: The 30-frame initial warmup loop (added to prevent spurious T=0 events)
+did `frame_idx += 1` but `frame_idx = 0` was defined 25 lines later in the state machine
+section. Python raises `UnboundLocalError` on the first warmup iteration.
 
-```python
-if in_event and not cancel_event.is_set():
-    event_end = current_pts + padding_s    # ~0.3 + 2 = 2.3s
-    duration = event_end - event_start     # 2.3 - 0 = 2.3s ≥ min_event_s=2 → KEPT
-```
+**Secondary bug (CRIT-2)**: Even if CRIT-1 was fixed by moving the initialisation,
+the state machine section had a second `frame_idx = 0` reset that would silently
+discard the warmup count — making `current_pts` wrong for the first 0.5–1.2 seconds
+of detected events.
 
-**Fix**: Added 30-frame initial warmup for fresh detection (not crash resume). MOG2 processes 30 frames silently to build a basic background model before event detection begins. 30 frames = 0.5s at 60fps, 1.2s at 25fps — short enough not to miss early motion.
+**Fix**: 
+1. Moved `frame_idx = 0` to immediately before the warmup block.
+2. Removed the stale `frame_idx = 0` in the state machine section.
+3. Warmup block increments `frame_idx` to `INITIAL_WARMUP` so `current_pts = frame_idx / target_fps` starts at the correct time offset (not T=0).
 
-```python
-INITIAL_WARMUP = 30
-if resume_pts is None:
-    for _ in range(INITIAL_WARMUP):
-        raw = proc.stdout.read(FRAME_SIZE)
-        ...
-        mog2.apply(gray)
-        frame_idx += 1  # so PTS remains accurate from first detected event
-```
+**Commit**: `002-detection-pts-fix`
 
 ---
 
-### BUG-DET-03 — detectShadows=True silently discarded all motion pixels
+### BUG-DET-03 — DIAG condition never fires after warmup (IMP-1)
 
-**Symptom**: 0 events detected regardless of sensitivity. No error, no failure. Fixed in commit `95e0a3c`.
+**Symptom**: After CRIT-1/CRIT-2 fix, `frame_idx` starts at `INITIAL_WARMUP=30`.
+The DIAG check was `frame_idx == 9` — never true when frame_idx starts at 30.
 
-**Root Cause**: MOG2 with `detectShadows=True` marks shadow pixels as `127` and confirmed foreground as `255`. The code then applied `cv2.threshold(fg_mask, 200, 255, THRESH_BINARY)` which converts `127→0`, silently removing all shadow-classified pixels. In surveillance footage with overhead lighting or directional light, most moving object pixels are classified as `127` (shadow). Result: 0 foreground pixels → 0 events.
+**Fix**: Changed condition to `frame_idx == INITIAL_WARMUP + 9` (10th frame of
+real detection, post-warmup). Log label updated to `[DIAG frame 40]`.
 
-**Fix**: `detectShadows=False`. All motion pixels are now `255`, nothing silently discarded. Morphological filter handles noise reduction instead.
-
----
-
-### BUG-DET-04 — fps filter stall on phone videos (edit list + timestamp mismatch)
-
-**Symptom**: Only 1–9 frames produced by FFmpeg (before DIAG fires), job completes with 0 events but no FAILED status.
-
-**Root Cause**: The `fps=target_fps` filter in FFmpeg maps source frames to output timestamps using: output frame N → source frame nearest to N/fps. The edit list made the first source frame's PTS = 0.195s. The fps filter expected a frame at PTS = 0.000s. No frame existed at 0.000s, so the filter couldn't produce output frame 0. It produced 1–9 frames from what frames it could, then stalled.
-
-**Fix**: `-fflags +genpts`. This regenerates all PTS from 0 starting at the first frame output (which is the first frame AFTER the edit list skip). The fps filter now receives frames starting at PTS=0,1/fps,2/fps,...— perfect alignment.
-
-**Additionally**: For `frame_skip=0` (process every frame), the `fps` filter is unnecessary. Removed it for that case. Only used when `frame_skip > 0`.
+**Commit**: `002-detection-pts-fix`
 
 ---
 
-### BUG-DET-05 — Morphological OPEN 5×5 erased legitimate motion
+### BUG-DET-04 — `detectShadows=True` silently discarded all motion
 
-**Symptom**: 0 events detected even when motion was confirmed by eye.
+**Symptom**: 0 events always. No error. Fixed in `95e0a3c`.
 
-**Root Cause**: The 5×5 elliptical kernel in `cv2.MORPH_OPEN` erodes 2 pixels from every edge of a foreground region. At 320×240 detection resolution, a person at medium distance might be only 15–20px wide. After OPEN, they'd be 11–16px wide — still above noise level. But at long distance or through a window, a 5px-wide silhouette becomes 1px after erosion and then disappears in dilation.
+**Root Cause**: MOG2 with `detectShadows=True` marks shadow pixels as `127` and
+confirmed foreground as `255`. The code applied `cv2.threshold(fg_mask, 200, 255,
+THRESH_BINARY)` which converts `127→0` — silently removing shadow-classified
+pixels. In surveillance footage most moving object pixels are classified as `127`.
 
-**Fix**: Changed kernel from `(5,5)` to `(3,3)`. Only erodes 1px from each edge. More small legitimate regions survive.
-
----
-
-### BUG-DET-06 — High sensitivity merges separate events (background noise bridges gap)
-
-**Symptom**: User expected 2 events, got 1. The event spans the entire active period including a long quiet gap.
-
-**Root Cause**: With `sensitivity=high`, `MOTION_THRESHOLD["high"] = 0.0005` (38 pixels). H.264 compression artifacts and camera noise can produce 40–80 pixels of "foreground" in an otherwise static scene. This keeps `is_motion=True` during the quiet gap between real events, so `silence_start` is never set for long enough to trigger event close (`min_gap_s=2`).
-
-**Not a code bug** — this is expected MOG2 behaviour at very high sensitivity. The solution is:
-- Use `sensitivity=medium` (threshold=154 pixels) for better event separation when events have long quiet gaps
-- Use `sensitivity=high` only when detecting subtle/distant motion and false positive rate is acceptable
+**Fix**: `detectShadows=False`. All motion pixels are `255`, nothing discarded.
+Morphological filter handles noise reduction instead.
 
 ---
 
-## FFmpeg Flag Reference for This Project
+### BUG-DET-05 — fps filter stall on phone videos (edit list + PTS mismatch)
 
-| Flag | Where used | Effect | When to use |
+**Symptom**: Only 1–9 frames produced. `[DIAG frame N]` never fires.
+
+**Root Cause**: `fps=target_fps` filter maps output timestamps to source frames by PTS.
+The edit list made first source frame PTS = 0.195s. The filter expected a frame at
+PTS = 0.000s. Mismatch → filter stalled after a few frames.
+
+**Fix**: `-fflags +igndts+genpts`. `+genpts` regenerates PTS from 0 starting at
+the first frame output (first valid frame after edit list skip). fps filter then
+receives frames at PTS=0,1/fps,2/fps — correct alignment.
+
+For `frame_skip=0` (process every frame): fps filter is unnecessary; removed.
+For `frame_skip>0`: fps filter remains and works correctly with `+genpts`.
+
+**Commit**: `4812ee5`
+
+---
+
+### BUG-DET-06 — Spurious T=0 event from MOG2 initialisation
+
+**Symptom**: 1 event found at T=0–2.5s with empty-scene preview.
+
+**Root Cause**: MOG2 starts with high-variance Gaussians. During the first ~30 frames
+the classifier is noisy, producing 30–200 foreground pixels exceeding the
+high-sensitivity threshold (38 px). End-of-video close block converts this noise
+into an event: `event_end = ~0.3 + 2 = 2.3s`, `duration >= min_event_s=2` → kept.
+
+**Fix**: 30-frame initial warmup for fresh detection. MOG2 processes frames silently
+to build a background model before event detection begins.
+
+**Commit**: `002-detection-pts-fix`
+
+---
+
+### BUG-DET-07 — Morphological OPEN 5×5 erased legitimate motion
+
+**Symptom**: 0 events even when motion confirmed by eye. Fixed in `0e329c8`.
+
+**Root Cause**: 5×5 elliptical kernel erodes 2px from every edge. At 320×240,
+distant subjects (5px wide) are erased entirely.
+
+**Fix**: Changed kernel from `(5,5)` to `(3,3)`. Only erodes 1px per edge.
+
+---
+
+### BUG-DET-08 — High sensitivity merges separate events
+
+**Symptom**: User expected 2 events, got 1 spanning entire active period.
+
+**Root Cause**: `threshold=0.0005` (38 pixels). H.264 compression artifacts produce
+40–80 pixels of "foreground" in a static scene, keeping `is_motion=True` during
+quiet gaps and preventing event closure.
+
+**Not a code bug** — expected MOG2 behaviour at very high sensitivity.
+Use `sensitivity=medium` (threshold=154 px) for better event separation.
+
+---
+
+## System Bug Register (non-detection)
+
+---
+
+### BUG-SYS-01 — `_restore_interrupted_jobs` re-runs detection on interrupted exports (CRIT-4)
+
+**File**: `app/core/job_queue.py`
+
+**Root Cause**: On service restart, any job in `exporting` state was reset to `queued`.
+The queue worker then re-ran full detection, even though detection completed and all
+events were in the DB. For a 24h video this meant 1–2h of unnecessary re-detection.
+
+**Fix**: Split restore logic:
+- `detecting/running` → `queued` (correct: re-run detection with checkpoint resume)
+- `exporting` → `completed` (correct: detection done, user can re-trigger export manually)
+
+---
+
+### BUG-SYS-02 — Export daemon thread crashes silently (CRIT-3, documented limitation)
+
+**File**: `app/api/export.py`
+
+**Root Cause**: Export runs in a daemon thread. If the thread is killed by OOM/signal
+(not a Python exception), the job stays in `exporting` state. `_restore_interrupted_jobs`
+now resets it to `completed` on next startup (BUG-SYS-01 fix).
+
+**Limitation**: If the service never restarts after OOM kill, the job shows `exporting`
+indefinitely. The 4-second polling fallback in the UI (`_pollInterval`) will not
+resolve this — it only polls until `completed` or `failed`.
+
+**Acceptable**: On 2GB Pi, OOM during stream-copy export is very unlikely.
+Re-encode exports could trigger it for long MJPEG files.
+
+---
+
+### BUG-SYS-03 — `frame_idx` UnboundLocalError (see BUG-DET-02)
+
+### BUG-SYS-04 — `asyncio.get_event_loop()` deprecated in Python 3.10+
+
+**File**: `app/main.py`
+
+**Fix**: Changed to `asyncio.get_running_loop()`. The lifespan context is an
+async function so a running loop is always available.
+
+---
+
+### BUG-SYS-05 — f-string JSON in `upload_init` breaks on filenames with quotes
+
+**File**: `app/api/upload.py`
+
+**Root Cause**: `f'{{"filename":"{filename}",...}}'` — a filename containing `"` or `\`
+produces malformed JSON, causing `upload_finalize` to crash with `json.JSONDecodeError`.
+
+**Fix**: `json.dumps({"filename": filename, "total_size": total_size})`.
+
+---
+
+### BUG-SYS-06 — Zone frame stored in `/tmp` — accumulates across jobs
+
+**File**: `app/api/jobs.py`
+
+**Root Cause**: Zone editor frame cached in `/tmp/zone_{job_id}.jpg`. Never cleaned up.
+On a 2GB Pi with limited storage, repeated zone frame requests fill `/tmp`.
+
+**Fix**: Store in `JOBS_DIR / job_id / "zone_frame.jpg"`. Cleaned up with the job.
+
+---
+
+### BUG-SYS-07 — Export polling interval leaks on page navigation (IMP-8)
+
+**File**: `static/js/pages/job-detail.js`
+
+**Root Cause**: `setInterval(...)` started on export, but `unmount()` didn't clear it.
+After navigation, interval continued polling `/api/jobs/{id}` every 4 seconds.
+
+**Fix**: Hoisted `_pollInterval` to module scope. `unmount()` now calls
+`clearInterval(_pollInterval)`.
+
+---
+
+### BUG-SYS-08 — `cctv-analyst.service` committed with real user's path
+
+**File**: `cctv-analyst.service`
+
+**Root Cause**: Template file contained `User=abhi` and hardcoded path. Misleading
+for any other installation. `install.sh` generates the correct file dynamically.
+
+**Fix**: Replaced with clearly-marked template using placeholder tokens.
+
+---
+
+## FFmpeg Flag Reference
+
+| Flag | Where | Effect | Rule |
 |---|---|---|---|
-| `-fflags +igndts` | Detection, Export | Ignore DTS, trust PTS | Always — NVR recordings often have broken DTS |
-| `-fflags +genpts` | Detection, Export | Regenerate PTS from 0 | Always — fixes edit list offset for fps filter |
-| `-fflags +discardcorrupt` | Export only | Skip corrupt frames silently | Optional — for damaged recordings |
-| `-ignore_editlist 1` | Export only (fast seek) | Skip edit list when seeking | Only for fast seek (-ss before -i); harmful for sequential decode from 0 |
-| `-avoid_negative_ts make_zero` | Export, Preview | Clamp negative PTS after seek | Always when using -ss with stream copy |
-| `-movflags faststart` | Export, Preview | MOOV atom first for streaming | Always for browser-played MP4 |
-
-**Rule**: Never add `-ignore_editlist 1` to the detection command. It is safe in export/preview (fast seek skips past pre-roll) but harmful in detection (sequential decode from frame 0 hits pre-roll frames).
+| `-fflags +igndts` | Detection, Export | Ignore DTS, trust PTS | Always — NVR recordings have broken DTS |
+| `-fflags +genpts` | Detection, Export | Regenerate PTS from 0 | Always — fixes edit list PTS offset for fps filter |
+| `-ignore_editlist 1` | Export preview only | Skip edit list when seeking | ONLY for fast seek (`-ss` before `-i`). NEVER in detection (sequential decode of pre-roll crashes) |
+| `-avoid_negative_ts make_zero` | Export, Preview | Clamp negative PTS after seek | Always with `-ss` + stream copy |
+| `-movflags faststart` | Export, Preview | MOOV atom first | Always for browser-played MP4 |
+| `detectShadows=False` | Detection MOG2 | All motion = 255 | Always — True was silently discarding shadow pixels |
 
 ---
 
-## Phone Video Quirks Reference
+## Sensitivity Calibration Guide
 
-| Metadata | Meaning | Impact |
-|---|---|---|
-| `com.android.video.temporal_layers_count` | Android temporal layer count marker | No decoding impact; just metadata |
-| Edit list at offset ~0.195s | Encoder pre-roll skip instruction | Honoured by default; do NOT ignore in detection |
-| `avg_frame_rate: 59.6` | Average frames per second | Source for `target_fps` calculation; accurate for CFR phone videos |
-| `r_frame_rate: 60000/1001` | Container-declared rate | Often slightly different from avg; avg is more reliable for timing |
+| Sensitivity | MOG2 history | varThreshold | Motion threshold | Min px (320×240) | Use case |
+|---|---|---|---|---|---|
+| low | 700 frames | 32 | 0.01 | 768 | Busy scenes, reduce false positives |
+| medium | 500 frames | 16 | 0.002 | 154 | Standard CCTV, recommended default |
+| high | 200 frames | 8 | 0.0005 | 38 | Distant/subtle motion, nighttime |
 
----
-
-## What Format Should Users Record In?
-
-**Best**: H.264 MP4 (`.mp4`) — stream copy, fast export, browser-playable preview. Most phones default to this.
-
-**Good**: H.265/HEVC MP4, H.264 MKV, H.264 TS — all stream-copy safe.
-
-**Slow export**: MJPEG `.avi` — requires re-encode; 1–2 hours per hour of footage.
-
-**Unsupported for stream copy**: VP9, AV1 — requires re-encode.
-
-No format change is required for the test video. H.264 MP4 from Android is correct.
+High sensitivity can merge separate events if background noise keeps `is_motion=True`
+during quiet gaps. Use medium for reliable event separation.
 
 ---
 
-*Last updated: 2026-05-10 — branch `002-detection-pts-fix`*
+## Video Format Reference
+
+| Format | Export | Speed | Notes |
+|---|---|---|---|
+| H.264 MP4 | Stream copy | ⚡ Fast | Recommended. Android/iPhone default. |
+| H.265/HEVC MP4 | Stream copy | ⚡ Fast | |
+| MJPEG AVI | Re-encode | 🐢 Slow | 1–2h per 24h footage |
+| VP9/AV1 | Re-encode | 🐢 Slow | Convert to H.264 first |
+
+Phone videos (Android/iPhone): H.264 MP4 with edit list. The edit list is normal —
+do NOT add `-ignore_editlist 1` to the detection pipeline. `+genpts` handles it correctly.
+
+---
+
+*Updated: 2026-05-10 — branch `002-detection-pts-fix`*

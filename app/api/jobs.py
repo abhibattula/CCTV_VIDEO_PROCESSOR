@@ -313,8 +313,12 @@ def zone_frame(job_id: str, width: int = Query(960), height: int = Query(540)):
     if not Path(source_path).exists():
         raise HTTPException(status_code=404, detail="Source file no longer accessible")
 
-    import tempfile, os
-    out_path = Path(tempfile.gettempdir()) / f"zone_{job_id}.jpg"
+    # IMP-5: store in job dir (not /tmp) so it is cleaned up with the job
+    # and does not accumulate across many jobs on the Pi's limited storage.
+    from app.config import JOBS_DIR
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    out_path = job_dir / "zone_frame.jpg"
 
     if not out_path.exists():
         duration = float(row["duration_s"] or 0)
