@@ -53,38 +53,55 @@ def _build_ffmpeg_cmd(
 ) -> list:
     """Build FFmpeg pipe command for detection.
 
-    Flag rationale:
+    Flag rationale — two separate FFmpeg failure modes for phone videos:
 
-    DO NOT add -ignore_editlist 1 here.
-        Android/iPhone videos embed an MP4 edit list specifying encoder pre-roll
-        (e.g. 11710/60000 = 0.195 s of warmup frames the encoder produced before
-        the first "real" frame). The edit list tells players to SKIP those frames.
-        When we force FFmpeg to IGNORE the edit list, it decodes those pre-roll
-        frames. They have broken/absent reference frames (codec warmup, not
-        intended for display). FFmpeg produces 10–29 corrupt output frames then
-        hits an unrecoverable decoder state and exits. Result: the main loop
-        breaks at frame 10–29, the video appears to be 0.5 s long, and all real
-        motion events are never processed. Honouring the edit list is correct —
-        FFmpeg skips the pre-roll and starts decoding from the first valid frame.
+    MODE A  (without -ignore_editlist): FFmpeg honours the edit list, tries to
+        find keyframe at index position 11710/60000=0.195 s. The index entry is
+        missing ("Cannot find an index entry before timestamp: 11710"). FFmpeg
+        outputs only what it can from a partial GOP (~30 frames at 60fps) then
+        reaches a self-imposed EOF. Detection gets 0 frames in the main loop.
+        Fix: +ignidx — FFmpeg ignores the broken index and scans the stream
+        linearly to find the edit list position. No index lookup required.
 
-    -fflags +igndts+genpts
-        +igndts : ignore Decode TimeStamps — trust Presentation TimeStamps.
-        +genpts : regenerate PTS from 0 starting at the first frame output
-                  (which is the first frame AFTER the edit list skip). This
-                  ensures the fps filter (when used) receives frames starting
-                  at PTS=0 regardless of what offset the edit list applies,
-                  so the fps filter does not stall after a handful of frames.
-                  Without +genpts, the fps filter sees first-frame PTS=0.195 s
-                  and expects output at 0.000 s → mismatch → early exit.
+    MODE B  (with -ignore_editlist 1 but without +discardcorrupt): FFmpeg
+        skips the edit list and decodes from absolute byte 0, including the
+        encoder pre-roll frames (0–0.195 s). These frames have broken/absent
+        reference frames (H.264 codec warmup). FFmpeg's decoder accumulates
+        errors and exits after 10–29 frames. Fix: +discardcorrupt — FFmpeg
+        discards frames the decoder cannot decode and keeps going.
+
+    COMBINED FIX (handles both modes simultaneously):
+        -ignore_editlist 1  bypass edit list segment_duration (which may be
+                            set incorrectly, causing FFmpeg to stop at 0.5 s)
+        +ignidx             scan stream linearly to find keyframes; bypasses
+                            the broken index that MODE A was tripping over
+        +discardcorrupt     silently discard pre-roll frames that fail to
+                            decode; MODE B protection
+        +igndts+genpts      clean up timestamps as before
+
+    NOTE on +ignidx and crash-resume seeking:
+        +ignidx disables index-based seeking. For crash-resume (-ss <time>),
+        FFmpeg must scan linearly to the seek position. For short videos this
+        is negligible; for 24 h recordings, a resume at the 20 h mark means
+        scanning 20 h of keyframes (~30 s at parse-speed). Acceptable given
+        that crash-resume on standard CCTV recordings (which have good indexes)
+        could use the index — so +ignidx is only added when ss is None (fresh
+        start). For crash-resume the index is used for fast seeking.
 
     fps filter — only when frame_skip > 0:
-        When frame_skip=0 we need every source frame; the fps filter would be
-        a no-op at target=source rate but still applies timestamp logic that
-        can stall. Skip it entirely for frame_skip=0.
-        When frame_skip>0, fps=target_fps drops frames efficiently in FFmpeg.
+        frame_skip=0: just scale. No fps filter, no timestamp dependency.
+        frame_skip>0: fps=target_fps drops frames in FFmpeg before the pipe.
     """
+    # Base flags — always applied
+    fflags = "+igndts+genpts+discardcorrupt"
+    # +ignidx only for fresh starts (no seek). For crash-resume, keep the
+    # index so FFmpeg can fast-seek to the resume timestamp.
+    if ss is None:
+        fflags += "+ignidx"
+
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-           "-fflags", "+igndts+genpts"]
+           "-fflags", fflags,
+           "-ignore_editlist", "1"]   # re-added: +discardcorrupt makes it safe
     if hw_decode:
         cmd += ["-hwaccel", "auto"]
     if ss is not None:
