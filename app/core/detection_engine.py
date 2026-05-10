@@ -54,33 +54,36 @@ def _build_ffmpeg_cmd(
     """Build FFmpeg pipe command for detection.
 
     Flag rationale:
-    -ignore_editlist 1
-        Phone videos (Android/iPhone) embed an MP4 edit list with a tiny
-        encoder-delay offset (e.g. 11710/60000 = 0.195 s). FFmpeg honours
-        it by seeking to that offset, but when the index entry is missing it
-        exits after only a few frames — never reaching the part of the video
-        that has motion.
+
+    DO NOT add -ignore_editlist 1 here.
+        Android/iPhone videos embed an MP4 edit list specifying encoder pre-roll
+        (e.g. 11710/60000 = 0.195 s of warmup frames the encoder produced before
+        the first "real" frame). The edit list tells players to SKIP those frames.
+        When we force FFmpeg to IGNORE the edit list, it decodes those pre-roll
+        frames. They have broken/absent reference frames (codec warmup, not
+        intended for display). FFmpeg produces 10–29 corrupt output frames then
+        hits an unrecoverable decoder state and exits. Result: the main loop
+        breaks at frame 10–29, the video appears to be 0.5 s long, and all real
+        motion events are never processed. Honouring the edit list is correct —
+        FFmpeg skips the pre-roll and starts decoding from the first valid frame.
 
     -fflags +igndts+genpts
-        +igndts  : ignore Decode TimeStamps, trust Presentation TimeStamps.
-        +genpts  : THE KEY FIX — regenerates PTS from scratch starting at 0.
-                   Without this, the fps filter sees source frames whose first
-                   PTS is 0.195 s (the edit list offset), while it expects
-                   frames starting at 0.000 s. The mismatch causes it to output
-                   1–9 frames then silently stop, which is why the [DIAG frame 10]
-                   line never appears and 0 events are found. With +genpts, every
-                   source frame gets a clean PTS starting at 0 → fps filter works
-                   for the full video.
+        +igndts : ignore Decode TimeStamps — trust Presentation TimeStamps.
+        +genpts : regenerate PTS from 0 starting at the first frame output
+                  (which is the first frame AFTER the edit list skip). This
+                  ensures the fps filter (when used) receives frames starting
+                  at PTS=0 regardless of what offset the edit list applies,
+                  so the fps filter does not stall after a handful of frames.
+                  Without +genpts, the fps filter sees first-frame PTS=0.195 s
+                  and expects output at 0.000 s → mismatch → early exit.
 
     fps filter — only when frame_skip > 0:
-        When frame_skip=0 every source frame must be processed; adding
-        fps=source_fps is a no-op that still applies the timestamp logic above
-        and risks the same stall. Skip the filter entirely — just scale and pipe.
-        When frame_skip>0, fps=target_fps correctly halves (or thirds, etc.)
-        the frame rate before Python sees any data.
+        When frame_skip=0 we need every source frame; the fps filter would be
+        a no-op at target=source rate but still applies timestamp logic that
+        can stall. Skip it entirely for frame_skip=0.
+        When frame_skip>0, fps=target_fps drops frames efficiently in FFmpeg.
     """
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-           "-ignore_editlist", "1",
            "-fflags", "+igndts+genpts"]
     if hw_decode:
         cmd += ["-hwaccel", "auto"]
@@ -269,6 +272,25 @@ def run(
     # erase small legitimate motion blobs (distant people, partial vehicles).
     # 3×3 OPEN only erodes 1px, preserving small real motion regions.
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+    # Initial warmup — fresh detection only (not crash resume, which has its own warmup).
+    # MOG2 initialises with high-variance Gaussians: during the first ~30 frames the
+    # classifier is noisy, often producing 30–200 foreground pixels that exceed the
+    # high-sensitivity threshold (38 px). Without warmup, this creates a spurious event
+    # at T=0 whose preview clip shows static empty scene — NOT the user's real motion.
+    # 30 frames = 0.5 s at 60fps, 1.2 s at 25fps — short enough not to miss early motion.
+    INITIAL_WARMUP = 30
+    if resume_pts is None:
+        logger(f"[DETECTION] MOG2 warmup ({INITIAL_WARMUP} frames) — stabilising background model")
+        for _ in range(INITIAL_WARMUP):
+            raw = proc.stdout.read(FRAME_SIZE)
+            if len(raw) < FRAME_SIZE:
+                break
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(H, W, 3)
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            mog2.apply(gray)
+            frame_idx += 1   # count warmup frames so PTS is correct from the first detected event
+        logger("[DETECTION] Warmup complete — event detection starting")
 
     # Warmup pass after crash resume (ISSUE-05)
     if resume_pts is not None:
