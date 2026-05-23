@@ -37,8 +37,8 @@ class JobQueue:
         conn = get_conn()
         # Jobs interrupted mid-detection → re-queue for detection (with checkpoint resume)
         conn.execute(
-            "UPDATE jobs SET status=? WHERE status IN (?,?,?)",
-            (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.DETECTING, JobStatus.RUNNING),
+            "UPDATE jobs SET status=? WHERE status IN (?,?)",
+            (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.DETECTING),
         )
         # Jobs interrupted mid-export → revert to completed so user can re-trigger export
         # without re-running detection. Detection output (events table) is intact.

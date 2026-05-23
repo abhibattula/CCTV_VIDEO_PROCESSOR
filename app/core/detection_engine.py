@@ -2,19 +2,39 @@
 8-step MOG2 detection pipeline.
 Runs entirely in a worker thread — no asyncio, no thread pool usage.
 
-Frame source: cv2.VideoCapture (replaces the previous FFmpeg-pipe approach).
+Frame source: cv2.VideoCapture with automatic normalization fallback.
 
-Why VideoCapture instead of FFmpeg pipe:
-  The FFmpeg CLI applies strict edit-list and index logic that caused early EOF
-  on Android/iPhone phone videos with broken MP4 indexes (edit list at timestamp
-  11710 with no matching index entry). Every flag combination — -ignore_editlist,
-  +ignidx, +discardcorrupt — resolved one failure mode but revealed another.
-  OpenCV's VideoCapture uses av_read_frame with lenient error policies and reads
-  all frames from this video successfully (confirmed: 6864 frames / 115 s).
-  VideoCapture also provides accurate per-frame timestamps via CAP_PROP_POS_MSEC,
-  simplifying the PTS tracking that previously required a showinfo stderr thread.
+--- Why VideoCapture instead of the original FFmpeg pipe ---
+The FFmpeg CLI applies strict edit-list and index logic. For Android phone
+recordings with a broken MP4 index (edit list pointing to an unindexed
+keyframe), every flag combination — -ignore_editlist, +ignidx, +discardcorrupt
+— resolved one failure mode and revealed another. FFmpeg CLI consistently
+produced only 30–38 frames from a 115-second 6864-frame video.
+
+OpenCV's VideoCapture uses av_read_frame internally with a lenient error-
+recovery loop that continues past the points where FFmpeg CLI gives up.
+On x86/Windows, VideoCapture reads all 6864 frames from the same file.
+
+--- Why normalization is also needed ---
+The pip wheel for opencv-python-headless on aarch64 (Raspberry Pi) may link
+against the OS's system libavcodec rather than bundling its own. If the OS
+libav has the same 30-frame limitation as FFmpeg CLI, VideoCapture on Pi
+would also fail. To cover this case, the engine probes VideoCapture with 60
+frames at startup. If fewer than 80 % succeed, it re-encodes the source to a
+clean H.264 MP4 using a VideoCapture-reads → FFmpeg-writes pipeline:
+
+  VideoCapture  ──raw BGR24 frames──►  FFmpeg stdin  ──libx264──►  normalized.mp4
+
+This sidesteps the libav INPUT problem (VideoCapture handles it) while
+producing a perfectly-formed OUTPUT that any VideoCapture can read.
+
+--- Crash resume ---
+The normalized.mp4 (if created) is stored in JOBS_DIR/{job_id}/ and reused on
+crash-resume. PTS from VideoCapture on the normalized file are valid because
+FFmpeg regenerates them from frame index when writing.
 """
 import json
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -33,23 +53,30 @@ from app.config import (
 from app.database import get_conn
 from app.utils.time_utils import seconds_to_clock
 
-# MOG2 background model parameters
+# ── MOG2 parameters ───────────────────────────────────────────────────────────
 SENSITIVITY_HISTORY = {"low": 700, "medium": 500, "high": 200}
 SENSITIVITY_VAR_THR  = {"low": 32,  "medium": 16,  "high": 8}
 
-# Motion ratio thresholds (fraction of 320×240 pixels that must be foreground)
-MOTION_THRESHOLD     = {"low": 0.01, "medium": 0.002, "high": 0.0005}
+# Motion ratio thresholds (fraction of W×H pixels that must be foreground).
+# 320×240 = 76,800 px; medium threshold = 154 px minimum.
+MOTION_THRESHOLD = {"low": 0.01, "medium": 0.002, "high": 0.0005}
 
-# Frames to stabilise MOG2 background model before event detection begins.
-# Fresh start: 30 frames (~0.5 s at 60 fps) — prevents spurious T=0 events
-#   from MOG2 initialisation noise.
-# Crash-resume: 500 frames to re-establish model after a mid-video seek.
-INITIAL_WARMUP = 30
-WARMUP_FRAMES  = 500
+# Warmup frames: stabilise MOG2 before event detection begins.
+INITIAL_WARMUP = 30    # Fresh start: ~0.5 s at 60 fps
+WARMUP_FRAMES  = 500   # Crash resume: re-establish model after seek
 
+# Frame-reading probe before committing to a full detection pass.
+PROBE_FRAMES = 60      # How many frames to test-read
+PROBE_OK_MIN  = 48     # Minimum successes (80 %) before triggering normalization
+
+# Log a progress line at most once every N seconds of video time.
+LOG_INTERVAL_S = 10.0
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _build_zone_mask(zones: list) -> Optional[np.ndarray]:
-    """Pre-render polygon mask from normalised [0-1] coordinates."""
+    """Pre-render polygon mask from normalised [0–1] coordinates."""
     if not zones:
         return None
     mask = np.zeros((H, W), dtype=np.uint8)
@@ -98,6 +125,198 @@ def _write_timeline(job_id: str, job: dict, events: list, source_duration_s: flo
     (job_dir / "timeline.json").write_text(json.dumps(timeline, indent=2))
 
 
+# ── Video opening with normalization fallback ─────────────────────────────────
+
+def _normalize_via_vc(
+    source_path: str,
+    normalized_path: str,
+    source_fps: float,
+    source_w: int,
+    source_h: int,
+    logger: Callable,
+) -> bool:
+    """
+    Read frames from source_path via VideoCapture and write them into a clean
+    H.264 MP4 via FFmpeg stdin. Bypasses the libav INPUT path that causes early
+    EOF on malformed phone videos, while producing a well-formed OUTPUT.
+
+    Returns True if the output was written successfully with > 100 frames.
+    """
+    logger(
+        f"[NORMALIZE] VideoCapture → FFmpeg pipe re-encode "
+        f"(source: {Path(source_path).name}, {source_w}×{source_h} @ {source_fps:.2f}fps)…"
+    )
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{source_w}x{source_h}",
+        "-r", str(source_fps),
+        "-i", "-",                          # Read raw frames from stdin
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-an",                              # Drop audio (not needed for detection)
+        normalized_path,
+    ]
+
+    cap = cv2.VideoCapture(source_path)
+    if not cap.isOpened():
+        logger("[NORMALIZE] Cannot open source with VideoCapture — aborting normalization")
+        return False
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        cap.release()
+        logger("[NORMALIZE] ffmpeg not found in PATH — cannot normalize")
+        return False
+
+    frame_count = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            try:
+                proc.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                logger("[NORMALIZE] FFmpeg stdin pipe broken — aborting")
+                break
+            frame_count += 1
+            if frame_count % 600 == 0:
+                logger(f"[NORMALIZE] Extracting frames… {frame_count} so far")
+    finally:
+        cap.release()
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        _, stderr_bytes = proc.communicate(timeout=60)
+        rc = proc.returncode
+
+    if rc != 0:
+        stderr_snippet = stderr_bytes.decode("utf-8", errors="replace")[-600:]
+        logger(f"[NORMALIZE] FFmpeg exited {rc}: {stderr_snippet}")
+        return False
+
+    if frame_count < 100:
+        logger(f"[NORMALIZE] Only {frame_count} frames extracted — source may be too short or unreadable")
+        return False
+
+    try:
+        size_mb = Path(normalized_path).stat().st_size / 1_048_576
+    except OSError:
+        size_mb = 0.0
+
+    logger(
+        f"[NORMALIZE] Complete — {frame_count} frames written, "
+        f"{size_mb:.1f} MB → {Path(normalized_path).name}"
+    )
+    return True
+
+
+def _open_video(
+    source_path: str,
+    job_dir: Path,
+    fallback_fps: float,
+    logger: Callable,
+) -> tuple:
+    """
+    Open a VideoCapture for detection, probing first and normalizing if needed.
+
+    1. Open VideoCapture on source_path.
+    2. Read PROBE_FRAMES frames. If < PROBE_OK_MIN succeed, the source is
+       malformed on this platform → normalize using _normalize_via_vc.
+    3. Re-open VideoCapture (on source or on normalized file) from frame 0.
+    4. Return (cap, total_frames, actual_fps).
+    """
+    normalized_path = str(job_dir / "normalized.mp4")
+
+    # Check if a cached normalization from a previous run exists
+    norm_file = job_dir / "normalized.mp4"
+    if norm_file.exists() and norm_file.stat().st_size > 10_000:
+        logger(f"[NORMALIZE] Cached normalized video found — using it")
+        cap = cv2.VideoCapture(str(norm_file))
+        if cap.isOpened():
+            tf = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+            fps = cap.get(cv2.CAP_PROP_FPS) or fallback_fps
+            return cap, tf, fps
+        cap.release()
+
+    # Open original
+    cap = cv2.VideoCapture(source_path)
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"VideoCapture cannot open: {source_path}. "
+            f"File may be corrupt or use an unsupported codec."
+        )
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    actual_fps   = cap.get(cv2.CAP_PROP_FPS) or fallback_fps
+    src_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Probe only if video is long enough
+    if total_frames > PROBE_FRAMES * 2:
+        probe_ok = 0
+        for _ in range(PROBE_FRAMES):
+            ret, _ = cap.read()
+            if ret:
+                probe_ok += 1
+            else:
+                break
+        cap.release()
+
+        if probe_ok < PROBE_OK_MIN:
+            logger(
+                f"[PROBE] VideoCapture read {probe_ok}/{PROBE_FRAMES} probe frames "
+                f"({probe_ok * 100 // PROBE_FRAMES}% success) — "
+                f"video is malformed on this platform. Normalizing…"
+            )
+            ok = _normalize_via_vc(
+                source_path, normalized_path, actual_fps, src_w, src_h, logger
+            )
+            if ok and norm_file.exists():
+                cap = cv2.VideoCapture(normalized_path)
+                if cap.isOpened():
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or total_frames
+                    actual_fps   = cap.get(cv2.CAP_PROP_FPS) or actual_fps
+                    logger(
+                        f"[NORMALIZE] Normalized video ready — "
+                        f"{total_frames} frames, {actual_fps:.2f}fps"
+                    )
+                    return cap, total_frames, actual_fps
+                cap.release()
+                logger("[NORMALIZE] Cannot open normalized file — falling back to original")
+
+            # Fallback: reopen original and hope for the best
+            cap = cv2.VideoCapture(source_path)
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot reopen original: {source_path}")
+        else:
+            # Probe succeeded — reopen from frame 0 for actual processing
+            logger(
+                f"[PROBE] {probe_ok}/{PROBE_FRAMES} frames read OK "
+                f"— VideoCapture is healthy"
+            )
+            cap = cv2.VideoCapture(source_path)
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot reopen: {source_path}")
+    # (else: short video — skip probe, use cap as-is)
+
+    return cap, total_frames, actual_fps
+
+
+# ── Main detection entry point ─────────────────────────────────────────────────
+
 def run(
     job_id: str,
     job: dict,
@@ -105,26 +324,26 @@ def run(
     cancel_event: threading.Event,
     logger: Callable[[str], None],
 ) -> None:
-    """Main detection pipeline entry point (VideoCapture-based)."""
+    """Main detection pipeline entry point."""
     from app.core.ram_guard import check as ram_check
 
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     (job_dir / "thumbnails").mkdir(exist_ok=True)
 
-    sensitivity    = settings.get("sensitivity", "medium")
-    frame_skip     = int(settings.get("frame_skip", 0))
-    padding_s      = float(settings.get("padding_s", 2))
-    min_gap_s      = float(settings.get("min_gap_s", 2))
-    min_event_s    = float(settings.get("min_event_s", 2))
-    zones          = settings.get("zones", [])
+    sensitivity     = settings.get("sensitivity", "medium")
+    frame_skip      = int(settings.get("frame_skip", 0))
+    padding_s       = float(settings.get("padding_s", 2))
+    min_gap_s       = float(settings.get("min_gap_s", 2))
+    min_event_s     = float(settings.get("min_event_s", 2))
+    zones           = settings.get("zones", [])
     recording_start = job.get("recording_start")
 
-    source_path     = job["source_path"]
-    source_fps      = float(job.get("source_fps") or 25.0)
+    source_path       = job["source_path"]
+    source_fps        = float(job.get("source_fps") or 25.0)
     source_duration_s = float(job.get("duration_s") or 0.0)
 
-    # ── Crash-resume setup ───────────────────────────────────────────────────
+    # ── Crash-resume setup ────────────────────────────────────────────────────
     checkpoint = _read_checkpoint(job_dir)
     resume_pts: Optional[float] = None
     last_confirmed_index = -1
@@ -144,32 +363,24 @@ def run(
     else:
         logger(f"[START] Detection started — source: {job['source_name']}")
 
-    # ── Open video with VideoCapture ─────────────────────────────────────────
-    # VideoCapture uses FFmpeg's av_read_frame internally with lenient error
-    # handling. It reads all frames from phone videos that the FFmpeg CLI fails
-    # on (broken MP4 index, edit list issues, temporal layers, pre-roll frames).
-    cap = cv2.VideoCapture(str(source_path))
-    if not cap.isOpened():
-        raise RuntimeError(
-            f"VideoCapture cannot open: {source_path}. "
-            f"File may be corrupt or use an unsupported codec."
-        )
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-    actual_fps   = cap.get(cv2.CAP_PROP_FPS) or source_fps
-
-    logger(
-        f"[DETECTION] VideoCapture opened — {total_frames} frames, "
-        f"{actual_fps:.2f}fps, {W}×{H}px detection, sensitivity={sensitivity}"
+    # ── Open video with normalization fallback ────────────────────────────────
+    cap, total_frames, actual_fps = _open_video(
+        source_path, job_dir, source_fps, logger
     )
 
-    # Seek to crash-resume position
+    logger(
+        f"[DETECTION] VideoCapture ready — {total_frames} frames, "
+        f"{actual_fps:.2f}fps, {W}×{H}px detection grid, "
+        f"sensitivity={sensitivity}"
+    )
+
+    # Seek to crash-resume position (after normalization check so correct file is open)
     if resume_pts is not None:
         cap.set(cv2.CAP_PROP_POS_MSEC, resume_pts * 1000)
         logger(f"[RESUME] Seeked to {resume_pts:.1f}s")
 
-    # ── MOG2 initialisation ──────────────────────────────────────────────────
-    history      = SENSITIVITY_HISTORY[sensitivity]
+    # ── MOG2 initialisation ───────────────────────────────────────────────────
+    history       = SENSITIVITY_HISTORY[sensitivity]
     var_threshold = SENSITIVITY_VAR_THR[sensitivity]
     mog2 = cv2.createBackgroundSubtractorMOG2(
         history=history, varThreshold=var_threshold, detectShadows=False
@@ -178,19 +389,17 @@ def run(
     clahe  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
-    # Zone mask
     zone_mask = _build_zone_mask(zones)
 
-    # frame_idx must be defined BEFORE the warmup block (warmup increments it)
+    # frame_idx MUST be defined before the warmup block (warmup increments it)
     frame_idx = 0
 
-    # ── Initial warmup (fresh start only) ───────────────────────────────────
-    # Skip the first INITIAL_WARMUP frames for event detection but feed them to
-    # MOG2 to build a stable background model. Without warmup, MOG2 init noise
-    # produces spurious events at T=0.
-    # Crash-resume has its own longer warmup (500 frames) below.
+    # ── Initial warmup (fresh start only) ─────────────────────────────────────
     if resume_pts is None:
-        logger(f"[DETECTION] MOG2 warmup ({INITIAL_WARMUP} frames) — stabilising background model")
+        logger(
+            f"[DETECTION] MOG2 warmup ({INITIAL_WARMUP} frames) — "
+            f"stabilising background model before event detection…"
+        )
         for _ in range(INITIAL_WARMUP):
             ret, frame = cap.read()
             if not ret:
@@ -199,13 +408,14 @@ def run(
             gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             mog2.apply(gray)
             frame_idx += 1
-        logger("[DETECTION] Warmup complete — event detection starting")
+        logger(
+            f"[DETECTION] Warmup complete ({frame_idx} frames) — "
+            f"event detection starting from here"
+        )
 
-    # ── Crash-resume warmup (re-establish background model after seek) ───────
-    # 500 frames needed because the scene at the seek point may look completely
-    # different from the background learned before the crash.
+    # ── Crash-resume warmup ───────────────────────────────────────────────────
     if resume_pts is not None:
-        logger(f"[RESUME] Warming up MOG2 background model ({WARMUP_FRAMES} frames)...")
+        logger(f"[RESUME] MOG2 warmup ({WARMUP_FRAMES} frames) after seek…")
         for _ in range(WARMUP_FRAMES):
             ret, frame = cap.read()
             if not ret:
@@ -213,24 +423,24 @@ def run(
             small = cv2.resize(frame, (W, H))
             gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             mog2.apply(gray)
-            # frame_idx intentionally NOT incremented here — PTS anchored by
-            # resume_pts, not frame count relative to seek position.
-        logger("[RESUME] Warmup complete — resuming detection")
+            # frame_idx intentionally NOT incremented — PTS anchored by resume_pts
+        logger("[RESUME] Warmup complete — resuming event detection")
 
-    # ── Segment state machine ────────────────────────────────────────────────
-    in_event        = False
-    event_start     = 0.0
+    # ── Segment state machine ─────────────────────────────────────────────────
+    in_event          = False
+    event_start       = 0.0
     event_start_clock = ""
-    silence_start   = 0.0
-    peak_score      = 0.0
+    silence_start     = 0.0
+    peak_score        = 0.0
     confirmed_events: list = []
-    event_index     = last_confirmed_index + 1
+    event_index       = last_confirmed_index + 1
 
-    conn = get_conn()
-    # frame_idx continues from INITIAL_WARMUP (not reset — keeps PTS accurate)
-    current_pts      = resume_pts or 0.0
-    first_frame_logged = False
-    batch_max_ratio  = 0.0
+    conn           = get_conn()
+    current_pts    = resume_pts or 0.0
+    first_frame_ok = False          # Guard for first-frame diagnostic
+    batch_max_ratio = 0.0
+    last_log_pts    = -LOG_INTERVAL_S   # Ensure first log fires immediately
+    diag_processed  = 0                 # Count of frames through the full pipeline
 
     try:
         while True:
@@ -241,67 +451,69 @@ def run(
             if cancel_event.is_set():
                 break
 
-            # Accurate timestamp from VideoCapture (milliseconds → seconds)
+            # Accurate timestamp: position AFTER the frame that was just read
             current_pts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
-            # Frame skip in Python: discard every (frame_skip) out of (frame_skip+1)
+            # Frame skip: discard (frame_skip) of every (frame_skip+1) frames
             if frame_skip > 0 and frame_idx % (frame_skip + 1) != 0:
                 frame_idx += 1
                 continue
 
-            # First-frame diagnostic: mean brightness reveals black-frame issues
-            if not first_frame_logged:
+            # ── First-frame diagnostic ─────────────────────────────────────
+            if not first_frame_ok:
                 mean_brightness = int(frame.mean())
                 logger(
-                    f"[DETECTION] First frame received — FFmpeg pipeline is working. "
-                    f"Frame brightness: {mean_brightness}/255 "
-                    f"{'(WARNING: very dark — check video)' if mean_brightness < 5 else '(OK)'}"
+                    f"[DETECTION] First frame received at T={current_pts:.2f}s — "
+                    f"VideoCapture pipeline is working. "
+                    f"Brightness: {mean_brightness}/255 "
+                    f"{'(WARNING: very dark — black frame?)' if mean_brightness < 5 else '(OK)'}"
                 )
-                first_frame_logged = True
+                first_frame_ok = True
 
-            # Resize to detection resolution
+            # ── Preprocess ────────────────────────────────────────────────
             small = cv2.resize(frame, (W, H))
-
-            # Step 3: Preprocess (OpenCV delivers BGR; convert to gray)
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)  # VideoCapture = BGR
             if sensitivity == "high":
                 gray = clahe.apply(gray)
 
-            # Step 4: MOG2 (detectShadows=False → all motion pixels are 255)
-            fg_mask     = mog2.apply(gray)
+            # ── MOG2 ─────────────────────────────────────────────────────
+            fg_mask      = mog2.apply(gray)
             raw_fg_count = cv2.countNonZero(fg_mask)
 
-            # Step 5: Morphological filter (3×3 OPEN removes noise, CLOSE fills gaps)
+            # ── Morphological filter ──────────────────────────────────────
             fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  kernel)
             fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
 
-            # Diagnostic at 10th real detection frame (post-warmup)
-            if frame_idx == INITIAL_WARMUP + 9:
+            diag_processed += 1
+
+            # ── 10th-frame diagnostic ─────────────────────────────────────
+            if diag_processed == 10:
                 after_morph = cv2.countNonZero(fg_mask)
                 needed      = int(motion_ratio_threshold * W * H)
                 logger(
-                    f"[DIAG frame {INITIAL_WARMUP + 10}] MOG2 raw={raw_fg_count}px "
-                    f"→ after_morph={after_morph}px "
-                    f"(need >={needed}px for a detection at {sensitivity} sensitivity)"
+                    f"[DIAG] 10th processed frame (T={current_pts:.2f}s) — "
+                    f"MOG2 raw={raw_fg_count}px → after_morph={after_morph}px "
+                    f"(need >={needed}px for {sensitivity} sensitivity)"
                 )
 
-            # Step 6: Zone mask
+            # ── Zone mask ─────────────────────────────────────────────────
             if zone_mask is not None:
                 fg_mask = cv2.bitwise_and(fg_mask, zone_mask)
 
-            # Step 7: Score
+            # ── Score ──────────────────────────────────────────────────────
             motion_ratio = cv2.countNonZero(fg_mask) / (W * H)
             is_motion    = motion_ratio >= motion_ratio_threshold
             if motion_ratio > batch_max_ratio:
                 batch_max_ratio = motion_ratio
 
-            # Step 8: Segment state machine
+            # ── Segment state machine ──────────────────────────────────────
             if not in_event and is_motion:
                 in_event          = True
                 event_start       = max(0.0, current_pts - padding_s)
                 event_start_clock = seconds_to_clock(event_start, recording_start)
                 peak_score        = motion_ratio
                 silence_start     = 0.0
+
             elif in_event:
                 if is_motion:
                     peak_score    = max(peak_score, motion_ratio)
@@ -327,10 +539,10 @@ def run(
                         silence_start = 0.0
                         peak_score    = 0.0
 
-            frame_idx  += 1
+            frame_idx   += 1
             frames_done += 1
 
-            # Checkpoint every BATCH_SIZE processed frames
+            # ── Checkpoint every BATCH_SIZE processed frames ────────────────
             if frame_idx % BATCH_SIZE == 0:
                 _flush_events(conn, job_id, confirmed_events, recording_start)
                 last_idx = (
@@ -340,41 +552,55 @@ def run(
                 confirmed_events.clear()
 
                 _write_checkpoint(job_dir, {
-                    "job_id":                    job_id,
-                    "frames_processed":          frames_done,
-                    "pts_time":                  current_pts,
+                    "job_id":                     job_id,
+                    "frames_processed":           frames_done,
+                    "pts_time":                   current_pts,
                     "last_confirmed_event_index": last_idx,
-                    "timestamp":                 datetime.now(timezone.utc).isoformat(),
+                    "timestamp":                  datetime.now(timezone.utc).isoformat(),
                 })
 
                 progress = min(frame_idx / max(total_frames, 1), 0.99)
                 conn.execute("UPDATE jobs SET progress=? WHERE id=?", (progress, job_id))
                 conn.commit()
 
-                elapsed = int(current_pts)
-                total_events_so_far = conn.execute(
-                    "SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)
-                ).fetchone()[0]
-                logger(
-                    f"[{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}] "
-                    f"Frame {frames_done}/{total_frames} — "
-                    f"max_motion={batch_max_ratio:.4f} (threshold={motion_ratio_threshold:.4f}) — "
-                    f"{total_events_so_far} events so far"
-                )
-                batch_max_ratio = 0.0
+                # Log only once per LOG_INTERVAL_S seconds of video time
+                if current_pts - last_log_pts >= LOG_INTERVAL_S:
+                    last_log_pts = current_pts
+                    elapsed      = int(current_pts)
+                    total_ev_db  = conn.execute(
+                        "SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)
+                    ).fetchone()[0]
+                    logger(
+                        f"[{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}] "
+                        f"Frame {frames_done}/{total_frames} — "
+                        f"max_motion={batch_max_ratio:.4f} "
+                        f"(threshold={motion_ratio_threshold:.4f}) — "
+                        f"{total_ev_db} events so far"
+                    )
+                    batch_max_ratio = 0.0
 
                 ram_check(job_id, logger)
 
                 if cancel_event.is_set():
                     break
 
-        # ── Zero-frames guard ─────────────────────────────────────────────────
+        # ── Zero-frames guard ──────────────────────────────────────────────────
         if frames_done == 0 and not cancel_event.is_set():
             raise RuntimeError(
                 f"VideoCapture produced 0 frames from: {source_path}. "
-                f"File may be corrupt or the codec is unsupported. "
-                f"Try re-encoding to H.264 MP4 with HandBrake."
+                f"The file may be corrupt, truncated, or use an unsupported codec. "
+                f"Try re-encoding to H.264 MP4 with HandBrake and re-uploading."
             )
+
+        # ── Low frame-count warning ────────────────────────────────────────────
+        if total_frames > 200 and not cancel_event.is_set():
+            coverage_pct = frames_done * 100 // max(total_frames, 1)
+            if coverage_pct < 50:
+                logger(
+                    f"[WARN] Only {frames_done}/{total_frames} frames processed "
+                    f"({coverage_pct}%). The video may be partially unreadable. "
+                    f"Events in the unread portion will be missed."
+                )
 
         # ── Close any open event at end of video ──────────────────────────────
         if in_event and not cancel_event.is_set():
@@ -405,12 +631,15 @@ def run(
         total_found = conn.execute(
             "SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)
         ).fetchone()[0]
-        logger(f"[DONE] Detection complete — {total_found} motion events found")
+        logger(
+            f"[DONE] Detection complete — {total_found} motion event(s) found "
+            f"from {frames_done} frames"
+        )
         if total_found == 0:
             logger(
-                "[HINT] No motion detected. Check the [DIAG] line above: "
-                "if after_morph >= needed, try Medium sensitivity for fewer false positives. "
-                "If [DIAG] is missing, the video produced too few frames — check the video plays in VLC."
+                "[HINT] No motion detected. "
+                "Check the [DIAG] line: if after_morph >= needed, try Medium sensitivity. "
+                "If [DIAG] is missing entirely, no frames were processed — check [PROBE]."
             )
 
     finally:
@@ -418,7 +647,7 @@ def run(
 
 
 def _flush_events(conn, job_id: str, events: list, recording_start: Optional[str]) -> None:
-    """Insert confirmed events into DB."""
+    """Insert confirmed events into DB (INSERT OR IGNORE guards against duplicate resume)."""
     ts = datetime.now(timezone.utc).isoformat()
     for ev in events:
         conn.execute(

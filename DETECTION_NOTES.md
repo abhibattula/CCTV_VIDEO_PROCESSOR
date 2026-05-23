@@ -2,18 +2,23 @@
 
 > Developer reference. Documents every detection bug found during deployment,
 > its root cause, the evidence chain, and the exact fix applied.
-> Updated: 2026-05-10 | Branch: `002-detection-pts-fix`
+> Updated: 2026-05-23 | Latest fix: `BUG-DET-09` (VideoCapture normalization fallback)
 
 ---
 
-## The Detection Pipeline (Brief)
+## The Detection Pipeline (Current)
 
 ```
-FFmpeg subprocess (stdout) → FRAME_SIZE bytes/frame → MOG2 → morphological filter
+cv2.VideoCapture (primary)
+  └── Probe 60 frames → if < 48 succeed:
+        _normalize_via_vc:  VideoCapture → raw BGR24 pipe → FFmpeg stdin → normalized.mp4
+        └── Reopen VideoCapture on normalized.mp4
+
+VideoCapture frames → resize 320×240 → MOG2 → morphological 3×3 filter
 → motion_ratio → segment state machine → events DB → log_buffer → SSE → browser
 ```
 
-FFmpeg subprocess stderr → background thread → filter lines → job log panel
+Normalization creates `JOBS_DIR/{job_id}/normalized.mp4` (cached; reused on crash-resume).
 
 ---
 
@@ -140,6 +145,51 @@ to build a background model before event detection begins.
 distant subjects (5px wide) are erased entirely.
 
 **Fix**: Changed kernel from `(5,5)` to `(3,3)`. Only erodes 1px per edge.
+
+---
+
+### BUG-DET-09 — VideoCapture on aarch64 (Pi) also stops at 30–38 frames
+
+**Symptom**: After switching from FFmpeg pipe to VideoCapture (`3bf49a9`), detection
+still returns 0 or 1 events. Warmup completes, but [DONE] fires immediately after,
+or `frames_done << total_frames`.
+
+**Root Cause**: `opencv-python-headless` pip wheels on aarch64 link against the OS
+system libavcodec rather than bundling their own FFmpeg. The system libav on Raspberry
+Pi OS has the same 30-frame early-EOF behaviour as the FFmpeg CLI for malformed Android
+phone videos (broken MP4 index + edit list). VideoCapture confirmed to read all 6864
+frames on x86-64 Windows (bundled FFmpeg), but fails on Pi (system libav).
+
+**Fix**: Pre-detection probe + VideoCapture-to-FFmpeg normalization fallback.
+
+1. **Probe**: Before warmup, read 60 frames with VideoCapture.
+   - If ≥ 48 succeed (80%): healthy file — proceed normally.
+   - If < 48 succeed: video is malformed on this platform — normalize.
+
+2. **Normalize** (`_normalize_via_vc`): Use VideoCapture as the READER (it handles
+   malformed inputs better than FFmpeg CLI) and FFmpeg as the WRITER (clean H.264 output):
+   ```
+   VideoCapture(source.mp4) → raw BGR24 frames → FFmpeg stdin → normalized.mp4
+   ```
+   Key: this completely bypasses the FFmpeg INPUT path that causes early EOF. FFmpeg
+   only encodes here, it never tries to read the malformed source.
+
+3. **Reopen**: Detect on `normalized.mp4` instead of the original. The normalized file
+   is a well-formed H.264 MP4 that any VideoCapture can read in full.
+
+4. **Crash-resume**: `normalized.mp4` is cached in `JOBS_DIR/{job_id}/`. On resume,
+   the engine checks if it exists and uses it automatically.
+
+**Additional changes in this fix:**
+- `diag_processed` counter replaces `frame_idx == INITIAL_WARMUP + 9` — DIAG now
+  fires reliably at the 10th processed frame regardless of frame_skip setting.
+- `LOG_INTERVAL_S = 10.0` — log every 10 seconds of video time instead of every
+  30 frames (at 60fps, the old rate produced 230 log lines for a 115s video,
+  saturating the 200-line UI ring buffer and hiding the DIAG line).
+- Duplicate `JobStatus.RUNNING` in `_restore_interrupted_jobs` SQL IN clause fixed
+  (benign but wrong; was `IN (RUNNING, DETECTING, RUNNING)` → now `IN (RUNNING, DETECTING)`).
+
+**Commit**: `fix: VideoCapture probe + normalization fallback for aarch64 Pi`
 
 ---
 
@@ -287,4 +337,18 @@ do NOT add `-ignore_editlist 1` to the detection pipeline. `+genpts` handles it 
 
 ---
 
-*Updated: 2026-05-10 — branch `002-detection-pts-fix`*
+---
+
+## BUG-SYS-09 — Duplicate `RUNNING` in `_restore_interrupted_jobs` SQL
+
+**File**: `app/core/job_queue.py`
+
+**Root Cause**: `IN (?,?,?)` with tuple `(QUEUED, RUNNING, DETECTING, RUNNING)` — the
+fourth value is a duplicate of the second. Caused no incorrect behaviour (SQL IN with
+duplicates deduplicates implicitly) but was misleading.
+
+**Fix**: Changed to `IN (?,?)` with tuple `(QUEUED, RUNNING, DETECTING)`.
+
+---
+
+*Updated: 2026-05-23 — `BUG-DET-09` normalization fallback for aarch64 Pi*
